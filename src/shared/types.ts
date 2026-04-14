@@ -332,6 +332,8 @@ export interface AppSettings {
   // Chrome sync
   chromeSyncEnabled: boolean
   chromeSyncProfileDir: string | null
+  // Where rendered links should open by default.
+  linkOpenMode: 'browser-block' | 'external-browser'
   // Local OpenAI-compat proxy endpoint remapping
   localProxyEnabled: boolean
   localProxyPort: number
@@ -381,6 +383,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   chromeSyncEnabled: false,
   chromeSyncProfileDir: null,
+  linkOpenMode: 'browser-block',
   localProxyEnabled: false,
   localProxyPort: 1337,
   pinnedExtensionIds: [],

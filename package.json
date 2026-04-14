@@ -5,7 +5,8 @@
   "description": "Infinite canvas workspace for AI agents",
   "main": "dist-electron/main/index.js",
   "bin": {
-    "codesurf": "bin/codesurf.cjs"
+    "codesurf": "bin/codesurf.cjs",
+    "codesurfd": "bin/codesurfd.mjs"
   },
   "files": [
     "bin/",
@@ -16,7 +17,8 @@
     "README.md"
   ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:daemon",
+    "test:daemon": "node --test test/daemon/*.test.mjs",
     "dev": "electron-vite dev -- --js-flags=\"--expose-gc --max-old-space-size=${CODESURF_MAX_OLD_SPACE_SIZE_MB:-8192}\"",
     "build:main": "EV_BUILD_TARGET=main electron-vite build",
     "build:preload": "EV_BUILD_TARGET=preload electron-vite build",
@@ -86,6 +88,7 @@
     },
     "files": [
       "dist-electron/**/*",
+      "bin/**/*",
       "package.json",
       "resources/**/*"
     ],

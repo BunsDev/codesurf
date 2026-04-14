@@ -274,6 +274,26 @@ interface ElectronAPI {
       arrayBuffers: number
       bus: { channels: number; events: number; subscriptions: number; readCursors: number }
     }>
+    daemonStatus(): Promise<{
+      running: boolean
+      info: {
+        pid: number
+        port: number
+        startedAt: string
+        protocolVersion: number
+        appVersion: string | null
+      } | null
+    }>
+    restartDaemon(): Promise<{
+      running: boolean
+      info: {
+        pid: number
+        port: number
+        startedAt: string
+        protocolVersion: number
+        appVersion: string | null
+      } | null
+    }>
     onGcRequested(callback: () => void): () => void
   }
 }

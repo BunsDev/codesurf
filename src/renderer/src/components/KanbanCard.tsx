@@ -7,6 +7,7 @@ import { useDetectedAgents } from '../hooks/useDetectedAgents'
 import { useMCPServers } from '../hooks/useMCPServers'
 import { useAppFonts } from '../FontContext'
 import { useTheme } from '../ThemeContext'
+import { dispatchOpenLink, findAnchorFromEventTarget } from '../utils/links'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -193,6 +194,24 @@ function ChatMarkdown({ text, isStreaming }: { text: string; isStreaming?: boole
   const theme = useTheme()
   const fonts = useAppFonts()
   usePatchCodeBlocks(ref, theme, fonts)
+  useEffect(() => {
+    const root = ref.current
+    if (!root) return
+
+    const handleClick = (event: MouseEvent) => {
+      const anchor = findAnchorFromEventTarget(event)
+      if (!anchor) return
+
+      const href = anchor.getAttribute('href') ?? ''
+      if (!dispatchOpenLink(href)) return
+
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    root.addEventListener('click', handleClick, true)
+    return () => root.removeEventListener('click', handleClick, true)
+  }, [])
   return (
     <div ref={ref}>
       <Streamdown className="chat-md" plugins={streamdownPlugins} mode={isStreaming ? 'streaming' : 'static'} shikiTheme={theme.mode === 'light' ? ['github-light', 'github-light'] : ['github-dark', 'github-dark']} controls={{ code: { copy: true, download: false }, table: false, mermaid: false }} lineNumbers={false}>

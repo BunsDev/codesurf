@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { Pin, Settings } from 'lucide-react'
-import type { Workspace, TileState } from '../../../shared/types'
+import type { ProjectRecord, Workspace, TileState } from '../../../shared/types'
 import { useAppFonts } from '../FontContext'
 import { useTheme } from '../ThemeContext'
 import { basename } from '../utils/dnd'
@@ -628,6 +628,7 @@ export function Sidebar({
   const [sectionsCollapsed, setSectionsCollapsed] = useState<Record<string, boolean>>({})
   const [sessionCtx, setSessionCtx] = useState<{ x: number; y: number; session: SessionEntry } | null>(null)
   const [sessions, setSessions] = useState<SessionEntry[]>([])
+  const [projects, setProjects] = useState<ProjectRecord[]>([])
   const [threadMenuOpen, setThreadMenuOpen] = useState(false)
   const [threadOrganizeMode, setThreadOrganizeMode] = useState<ThreadOrganizeMode>('project')
   const [threadSortMode, setThreadSortMode] = useState<ThreadSortMode>('updated')
@@ -641,6 +642,30 @@ export function Sidebar({
   const deleteConfirmTimerRef = useRef<number | null>(null)
   const threadMenuRef = useRef<HTMLDivElement>(null)
 
+  useEffect(() => {
+    let cancelled = false
+
+    const loadProjects = async () => {
+      const listProjects = window.electron.workspace.listProjects
+      if (typeof listProjects !== 'function') {
+        if (!cancelled) setProjects([])
+        return
+      }
+
+      const next = await listProjects().catch(() => null)
+      if (cancelled || !next) return
+      setProjects(next)
+    }
+
+    void loadProjects()
+    window.addEventListener('focus', loadProjects)
+
+    return () => {
+      cancelled = true
+      window.removeEventListener('focus', loadProjects)
+    }
+  }, [workspaces])
+
   const projectEntries = useMemo<ProjectListEntry[]>(() => {
     const workspaceIdsByPath = new Map<string, string[]>()
     for (const workspaceEntry of workspaces) {
@@ -651,7 +676,17 @@ export function Sidebar({
       }
     }
 
-    return deriveProjectsFromWorkspaces(workspaces)
+    const sourceProjects = projects.length > 0
+      ? projects.map(project => ({
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        workspaceIds: [],
+        representativeWorkspaceId: null,
+      }))
+      : deriveProjectsFromWorkspaces(workspaces)
+
+    return sourceProjects
       .map(project => {
         const normalizedPath = normalizeSidebarPath(project.path)
         const workspaceIds = workspaceIdsByPath.get(normalizedPath) ?? []
@@ -665,7 +700,7 @@ export function Sidebar({
       })
       .filter(project => project.workspaceIds.length > 0)
       .sort((a, b) => getProjectDisplayLabel(a).localeCompare(getProjectDisplayLabel(b), undefined, { sensitivity: 'base' }))
-  }, [workspaces, workspace?.id])
+  }, [projects, workspaces, workspace?.id])
 
   const workspaceById = useMemo(() => new Map(workspaces.map(workspaceEntry => [workspaceEntry.id, workspaceEntry] as const)), [workspaces])
 

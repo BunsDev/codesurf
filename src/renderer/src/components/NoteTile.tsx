@@ -6,6 +6,7 @@ import { useAppFonts } from '../FontContext'
 import { useTheme } from '../ThemeContext'
 import { useTileColor } from '../TileColorContext'
 import { ensureMonacoConfigured } from '../monaco'
+import { dispatchOpenLink, findAnchorFromEventTarget } from '../utils/links'
 
 interface Props {
   tileId?: string
@@ -460,6 +461,25 @@ function FileNote({ filePath, initialContent }: { filePath?: string; initialCont
     wrapper.innerHTML = rendered // eslint-disable-line -- content is HTML-escaped by renderMarkdown
     while (wrapper.firstChild) previewRef.current.appendChild(wrapper.firstChild)
   }, [mode, content])
+
+  useEffect(() => {
+    const root = previewRef.current
+    if (!root) return
+
+    const handleClick = (event: MouseEvent) => {
+      const anchor = findAnchorFromEventTarget(event)
+      if (!anchor) return
+
+      const href = anchor.getAttribute('href') ?? ''
+      if (!dispatchOpenLink(href)) return
+
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    root.addEventListener('click', handleClick, true)
+    return () => root.removeEventListener('click', handleClick, true)
+  }, [])
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: theme.editor.background, position: 'relative' }}>

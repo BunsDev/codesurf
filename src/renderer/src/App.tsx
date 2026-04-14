@@ -12,6 +12,7 @@ import { DEFAULT_THEME_ID, getThemeById, resolveEffectiveThemeId, registerCustom
 import type { PanelNode } from './components/PanelLayout'
 import { createLeaf, removeTileFromTree, addTabToLeaf, getAllTileIds, splitLeaf, closeOthersInLeaf, closeToRightInLeaf, findLeafById } from './components/PanelLayout'
 import { basename, getDroppedPaths, toFileUrl, isMediaFile } from './utils/dnd'
+import { CODESURF_OPEN_LINK_EVENT, stripLocalPathLocation, type CodeSurfOpenLinkDetail } from './utils/links'
 import { disposeChatTileRuntimeState, setChatTileRuntimeState } from './components/chatTileRuntimeState'
 import { disposeMediaTile } from './components/MediaTile'
 import { MainStatusBar } from './components/MainStatusBar'
@@ -153,6 +154,23 @@ function toBrowserTileUrl(filePath: string): string {
   return filePath
 }
 
+function hrefToLocalPath(href: string): string | null {
+  const trimmed = String(href ?? '').trim()
+  if (!trimmed) return null
+
+  if (trimmed.startsWith('/')) return stripLocalPathLocation(trimmed)
+
+  if (trimmed.startsWith('file://')) {
+    try {
+      return stripLocalPathLocation(decodeURIComponent(new URL(trimmed).pathname))
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
 function withAlpha(color: string, alpha: number): string {
   const trimmed = color.trim()
 
@@ -265,6 +283,7 @@ type DiscoveryState = {
 }
 
 const DISCOVERY_PULSE_DURATION_MS = 1100
+const DISCOVERY_MAX_DISTANCE_MULTIPLIER = 2.1
 const SETTINGS_CACHE_KEY = 'contex:settings-cache'
 const BRAND_WORDMARK_CACHE_KEY = 'contex:brand-wordmark-index'
 const BRAND_WORDMARK_PALETTE_CACHE_KEY = 'contex:brand-wordmark-palette-index'
@@ -280,7 +299,7 @@ function readCachedSettings(): AppSettings {
 }
 
 function getDiscoveryMaxDistance(largeGridStep: number): number {
-  return Math.max(largeGridStep * 3, largeGridStep)
+  return Math.max(largeGridStep * DISCOVERY_MAX_DISTANCE_MULTIPLIER, largeGridStep)
 }
 
 function uniq<T>(items: T[]): T[] {
@@ -1429,6 +1448,30 @@ function App(): JSX.Element {
 
     return newTile.id
   }, [nextZIndex, viewport, viewportCenter, saveCanvas, panelLayout, activePanelId, getInitialTileSize, snapValue, triggerDiscoveryPulse, settings.gridSize, settings.gridSpacingSmall])
+
+  useEffect(() => {
+    const handleOpenLink = (event: Event) => {
+      const customEvent = event as CustomEvent<CodeSurfOpenLinkDetail>
+      const href = String(customEvent.detail?.href ?? '').trim()
+      if (!href) return
+
+      const localPath = hrefToLocalPath(href)
+      if (localPath) {
+        void resolveFileTileType(localPath).then(type => addTile(type, localPath))
+        return
+      }
+
+      if (settings.linkOpenMode === 'external-browser') {
+        void window.electron?.shell?.openExternal?.(href)
+        return
+      }
+
+      addTile('browser', href)
+    }
+
+    window.addEventListener(CODESURF_OPEN_LINK_EVENT, handleOpenLink as EventListener)
+    return () => window.removeEventListener(CODESURF_OPEN_LINK_EVENT, handleOpenLink as EventListener)
+  }, [addTile, settings.linkOpenMode])
 
   useEffect(() => {
     if (!tiles.some(tile => tile.width < getMinTileWidth(tile) || tile.height < getMinTileHeight(tile))) return

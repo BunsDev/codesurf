@@ -10,6 +10,7 @@ import type {
   ExtensionChatTransportConfig,
 } from '../../../shared/types'
 import { basename, getDroppedPaths, isImagePath } from '../utils/dnd'
+import { dispatchOpenLink, findAnchorFromEventTarget } from '../utils/links'
 import {
   ShieldCheck, ChevronDown,
   Check, ArrowUp, ArrowDown, Square, MessageSquare, Bot,
@@ -656,24 +657,6 @@ function normalizeChatMarkdownText(text: string): string {
     .replace(/<\/image>/g, '')
 }
 
-function resolveLocalMarkdownPath(href: string): string | null {
-  const trimmed = href.trim()
-  if (!trimmed) return null
-
-  const decoded = trimmed.startsWith('file://')
-    ? decodeURIComponent(new URL(trimmed).pathname)
-    : trimmed
-
-  if (!decoded.startsWith('/')) return null
-
-  const lineHashIndex = decoded.indexOf('#L')
-  const colonLineMatch = decoded.match(/:\d+(?::\d+)?$/)
-
-  if (lineHashIndex >= 0) return decoded.slice(0, lineHashIndex)
-  if (colonLineMatch) return decoded.slice(0, decoded.length - colonLineMatch[0].length)
-  return decoded
-}
-
 const ChatMarkdown = React.memo(({ text, isStreaming, className }: {
   text: string
   isStreaming?: boolean
@@ -690,25 +673,32 @@ const ChatMarkdown = React.memo(({ text, isStreaming, className }: {
     if (!root) return
 
     const handleClick = (event: MouseEvent) => {
-      const target = event.target instanceof Element ? event.target : null
-      const anchor = target?.closest('a')
+      const anchor = findAnchorFromEventTarget(event)
       if (!anchor) return
 
       const href = anchor.getAttribute('href') ?? ''
-      const localPath = resolveLocalMarkdownPath(href)
-      if (!localPath) return
+      if (!dispatchOpenLink(href)) return
 
       event.preventDefault()
       event.stopPropagation()
-      void window.electron?.fs?.revealInFinder?.(localPath)
     }
 
-    root.addEventListener('click', handleClick)
-    return () => root.removeEventListener('click', handleClick)
+    root.addEventListener('click', handleClick, true)
+    return () => root.removeEventListener('click', handleClick, true)
   }, [])
 
   return (
-    <div ref={ref} style={{ minWidth: 0, maxWidth: '100%', width: '100%', overflow: 'hidden' }}>
+    <div
+      ref={ref}
+      style={{
+        minWidth: 0,
+        maxWidth: '100%',
+        width: '100%',
+        overflow: 'hidden',
+        ['--chat-link-color' as string]: theme.accent.base,
+        ['--chat-link-hover-color' as string]: theme.accent.hover,
+      }}
+    >
       <Streamdown
         className={`chat-md ${className ?? ''}`}
         plugins={streamdownPlugins}
@@ -1008,8 +998,8 @@ function ensureShimmerStyle(): void {
     .chat-md ul:last-child, .chat-md ol:last-child { margin-bottom: 0; }
     .chat-md li { line-height: 1.55; margin-bottom: 2px; }
     .chat-md li > p { margin: 0; }
-    .chat-md a { color: ${theme.accent.base}; opacity: 1; text-decoration: underline; text-underline-offset: 2px; }
-    .chat-md a:hover { color: ${theme.accent.hover}; opacity: 1; }
+    .chat-md a { color: var(--chat-link-color, #4f8cff); opacity: 1; text-decoration: underline; text-underline-offset: 2px; }
+    .chat-md a:hover { color: var(--chat-link-hover-color, #77a2ff); opacity: 1; }
     .chat-md blockquote {
       border-left: 3px solid rgba(128,128,128,0.4); padding-left: 10px;
       margin: 6px 0; opacity: 0.85;
@@ -2485,7 +2475,9 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             <div key={msg.id} style={{
               display: 'flex', flexDirection: 'column',
               alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
-              maxWidth: msg.role === 'user' ? '60%' : '70%', minWidth: 0,
+              width: msg.role === 'user' ? 'auto' : '100%',
+              maxWidth: msg.role === 'user' ? '60%' : '100%',
+              minWidth: 0,
               alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
               marginBottom: msg.role === 'user' ? 5 : 0,
               gap: 6,
@@ -2623,9 +2615,9 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            width: 52,
-            height: 52,
-            minWidth: 52,
+            width: 40,
+            height: 40,
+            minWidth: 40,
             padding: 0,
             borderRadius: '50%',
             border: `1px solid ${theme.chat.divider}`,
@@ -2637,7 +2629,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             ...NON_SELECTABLE_UI_STYLE,
           }}
         >
-          <ArrowDown size={26} strokeWidth={1.9} />
+          <ArrowDown size={20} strokeWidth={1.8} />
         </button>
       )}
 
@@ -3033,7 +3025,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             <ToolbarBtn
               icon={<ThinkingIcon level={thinking} />}
               tooltip={`Thinking: ${THINKING_OPTIONS.find(t => t.id === thinking)?.label ?? 'Adaptive'}`}
-              color={thinking === 'none' ? undefined : theme.chat.text}
+              color={thinking === 'none' ? theme.chat.muted : theme.chat.textSecondary}
               onClick={() => toggleMenu('thinking')}
             />
             {showThinkingMenu && (

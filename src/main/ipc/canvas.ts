@@ -1,12 +1,13 @@
 import { BrowserWindow, ipcMain } from 'electron'
 import { promises as fs } from 'fs'
-import { basename, dirname, join } from 'path'
+import { join } from 'path'
 import type { TileState } from '../../shared/types'
 import { CONTEX_HOME } from '../paths'
-import { findSessionEntryById, getExternalSessionChatState, invalidateExternalSessionCache, listExternalSessionEntries, type AggregatedSessionEntry } from '../session-sources'
+import type { AggregatedSessionEntry } from '../session-sources'
 import { getWorkspacePathById, getWorkspaceStorageIds } from './workspace'
 import { isRelayHostActive } from '../relay/registration'
 import { syncWorkspaceRelayParticipants } from '../relay/service'
+import { daemonClient } from '../daemon/client'
 
 function assertSafeId(id: string): void {
   if (/[\/\\]|\.\./.test(id)) throw new Error(`Unsafe ID: ${id}`)
@@ -221,21 +222,6 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function moveFileToDeleted(filePath: string): Promise<string> {
-  const sourceDir = dirname(filePath)
-  const deletedDir = join(sourceDir, 'deleted')
-  await fs.mkdir(deletedDir, { recursive: true })
-
-  const base = basename(filePath)
-  let targetPath = join(deletedDir, base)
-  if (await pathExists(targetPath)) {
-    targetPath = join(deletedDir, `${Date.now()}-${base}`)
-  }
-
-  await fs.rename(filePath, targetPath)
-  return targetPath
-}
-
 export function registerCanvasIPC(): void {
   ipcMain.handle('canvas:load', async (_, workspaceId: string) => {
     const storageIds = await ensureWorkspaceStorageMigrated(workspaceId)
@@ -331,67 +317,12 @@ export function registerCanvasIPC(): void {
   // project/user .codesurf sessions and external provider session stores.
   ipcMain.handle('canvas:listSessions', async (_, workspaceId: string, forceRefresh = false) => {
     assertSafeId(workspaceId)
-    const storageIds = await ensureWorkspaceStorageMigrated(workspaceId)
     const workspacePath = await getWorkspacePathById(workspaceId)
-    const sessions: AggregatedSessionEntry[] = []
-
-    for (const storageId of storageIds) {
-      const dotDir = join(CONTEX_HOME, 'workspaces', storageId, '.contex')
-      try {
-        const entries = await fs.readdir(dotDir)
-        const tileStateFiles = entries.filter(name => name.startsWith('tile-state-') && name.endsWith('.json'))
-
-        for (const file of tileStateFiles) {
-          try {
-            const filePath = join(dotDir, file)
-            const tileId = file.replace('tile-state-', '').replace('.json', '')
-            const summaryPath = tileSessionSummaryPath(storageId, tileId)
-            let summary = await readTileSessionSummary(summaryPath)
-
-            if (!summary) {
-              const raw = await fs.readFile(filePath, 'utf8')
-              const state = JSON.parse(raw)
-              const stat = await fs.stat(filePath)
-              summary = extractTileSessionSummary(tileId, state)
-              if (summary) {
-                summary.updatedAt = stat.mtimeMs
-                await fs.writeFile(summaryPath, JSON.stringify(summary, null, 2))
-                tileSessionSummaryCache.set(summaryPath, summary)
-              }
-            }
-
-            if (!summary) continue
-
-            sessions.push({
-              id: `codesurf-tile:${file}`,
-              source: 'codesurf',
-              scope: 'workspace',
-              tileId,
-              sessionId: summary.sessionId,
-              provider: summary.provider,
-              model: summary.model,
-              messageCount: summary.messageCount,
-              lastMessage: summary.lastMessage,
-              updatedAt: summary.updatedAt,
-              title: summary.title,
-              filePath,
-              projectPath: workspacePath,
-              sourceLabel: 'CodeSurf',
-              sourceDetail: summary.provider || 'Workspace chat',
-              canOpenInChat: true,
-              canOpenInApp: false,
-              nestingLevel: 0,
-            })
-          } catch {
-            // skip corrupt files
-          }
-        }
-      } catch {
-        // skip missing alias storage dirs
-      }
+    const sessions: AggregatedSessionEntry[] = await daemonClient.listLocalSessions(workspaceId).catch(() => [])
+    for (const session of sessions) {
+      if (!session.projectPath) session.projectPath = workspacePath
     }
-
-    sessions.push(...await listExternalSessionEntries(workspacePath, { force: forceRefresh }))
+    sessions.push(...await daemonClient.listExternalSessions(workspacePath, forceRefresh).catch(() => []))
     sessions.sort((a, b) => b.updatedAt - a.updatedAt)
     return sessions
   })
@@ -400,20 +331,10 @@ export function registerCanvasIPC(): void {
     const workspacePath = await getWorkspacePathById(workspaceId)
 
     if (sessionEntryId.startsWith('codesurf-tile:')) {
-      const tileId = sessionEntryId.replace('codesurf-tile:tile-state-', '').replace('.json', '')
-      const storageIds = await ensureWorkspaceStorageMigrated(workspaceId)
-      for (const storageId of storageIds) {
-        try {
-          const raw = await fs.readFile(tileStatePath(storageId, tileId), 'utf8')
-          return JSON.parse(raw)
-        } catch {
-          // try next alias storage dir
-        }
-      }
-      return null
+      return await daemonClient.getLocalSessionState(workspaceId, sessionEntryId).catch(() => null)
     }
 
-    return getExternalSessionChatState(workspacePath, sessionEntryId)
+    return await daemonClient.getExternalSessionState(workspacePath, sessionEntryId).catch(() => null)
   })
 
   ipcMain.handle('canvas:deleteSession', async (_, workspaceId: string, sessionEntryId: string) => {
@@ -421,51 +342,20 @@ export function registerCanvasIPC(): void {
     const workspacePath = await getWorkspacePathById(workspaceId)
 
     if (sessionEntryId.startsWith('codesurf-tile:')) {
-      const tileId = sessionEntryId.replace('codesurf-tile:tile-state-', '').replace('.json', '')
-      const storageIds = await ensureWorkspaceStorageMigrated(workspaceId)
-      for (const storageId of storageIds) {
-        const filePath = tileStatePath(storageId, tileId)
-        if (!(await pathExists(filePath))) continue
-        await moveFileToDeleted(filePath)
-        await deleteFileIfExists(tileSessionSummaryPath(storageId, tileId))
-        tileSessionSummaryCache.delete(tileSessionSummaryPath(storageId, tileId))
-      }
-      broadcastSessionsChanged(workspaceId)
-      return { ok: true }
+      const result = await daemonClient.deleteLocalSession(workspaceId, sessionEntryId).catch(error => ({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      if (result.ok) broadcastSessionsChanged(workspaceId)
+      return result
     }
 
-    const entry = await findSessionEntryById(workspacePath, sessionEntryId)
-    if (!entry?.filePath) return { ok: false, error: 'Session file not found' }
-    if (!(await pathExists(entry.filePath))) return { ok: false, error: 'Session file missing' }
-
-    const deletedPath = await moveFileToDeleted(entry.filePath)
-
-    if (entry.source === 'openclaw') {
-      const [, agentId, ...keyParts] = sessionEntryId.split(':')
-      const sessionKey = keyParts.join(':')
-      const indexPath = join(process.env.HOME || '', '.openclaw', 'agents', agentId, 'sessions', 'sessions.json')
-      if (agentId && sessionKey && await pathExists(indexPath)) {
-        try {
-          const raw = await fs.readFile(indexPath, 'utf8')
-          const parsed = JSON.parse(raw) as Record<string, any>
-          if (parsed[sessionKey] && typeof parsed[sessionKey] === 'object') {
-            parsed[sessionKey] = {
-              ...parsed[sessionKey],
-              deletedAt: Date.now(),
-              deletedFile: deletedPath,
-              sessionFile: deletedPath,
-            }
-            await fs.writeFile(indexPath, JSON.stringify(parsed, null, 2))
-          }
-        } catch {
-          // ignore index update failures; file move already succeeded
-        }
-      }
-    }
-
-    invalidateExternalSessionCache(workspacePath)
-    broadcastSessionsChanged(workspaceId)
-    return { ok: true }
+    const result = await daemonClient.deleteExternalSession(workspacePath, sessionEntryId).catch(error => ({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    if (result.ok) broadcastSessionsChanged(workspaceId)
+    return result
   })
 
   ipcMain.handle('canvas:deleteTileArtifacts', async (_, workspaceId: string, tileId: string) => {

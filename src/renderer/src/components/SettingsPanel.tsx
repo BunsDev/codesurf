@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef, lazy } from 'react'
-import type { AppSettings, FontSettings, FontToken } from '../../../shared/types'
+import type { AppSettings, FontToken } from '../../../shared/types'
 import { DEFAULT_FONTS, withDefaultSettings } from '../../../shared/types'
 import { Settings, Type, Monitor, FolderOpen, Plus, Trash2, ChevronDown, ChevronRight, FileJson, AlertTriangle, Check, Copy, RotateCcw, FormInput, Code2, Puzzle, RefreshCw, Star, Wrench, Users, FileText, Globe, Eye, EyeOff, PanelRight, Pin } from 'lucide-react'
 import { useAppFonts } from '../FontContext'
@@ -88,6 +88,7 @@ function notifyExtensionsChanged(): void {
 
 // ─── Extension settings panel ─────────────────────────────────────────────────
 function ExtSettingsPanel({ extId, tileType }: { extId: string; tileType: string }): React.JSX.Element {
+  const theme = useTheme()
   const [src, setSrc] = useState<string | null>(null)
   useEffect(() => {
     window.electron.extensions?.tileEntry?.(extId, tileType)
@@ -351,6 +352,17 @@ function SectionLabel({ label }: { label: string }): React.JSX.Element {
 
 interface ChromeProfile { name: string; dir: string; email?: string }
 
+type DaemonStatus = {
+  running: boolean
+  info: {
+    pid: number
+    port: number
+    startedAt: string
+    protocolVersion: number
+    appVersion: string | null
+  } | null
+}
+
 function ChromeSyncSection({ settings, onUpdate, theme }: {
   settings: AppSettings
   onUpdate: (key: keyof AppSettings, value: any) => void
@@ -494,6 +506,10 @@ export function SettingsPanel({ onClose, settings: initialSettings, onSettingsCh
   const [extensionsError, setExtensionsError] = useState<string | null>(null)
   const [expandedExtId, setExpandedExtId] = useState<string | null>(null)
   const [extSettingsMap, setExtSettingsMap] = useState<Record<string, Record<string, unknown>>>({})
+  const [daemonStatus, setDaemonStatus] = useState<DaemonStatus | null>(null)
+  const [daemonLoading, setDaemonLoading] = useState(false)
+  const [daemonRestarting, setDaemonRestarting] = useState(false)
+  const [daemonError, setDaemonError] = useState<string | null>(null)
 
   const latestSettingsSaveRef = useRef(0)
   const settingsRef = useRef<AppSettings>(withDefaultSettings(initialSettings))
@@ -509,6 +525,66 @@ export function SettingsPanel({ onClose, settings: initialSettings, onSettingsCh
       if (cfg) setMcpConfig(cfg as MCPConfig)
     })
   }, [])
+
+  const loadDaemonStatus = useCallback(async () => {
+    setDaemonLoading(true)
+    setDaemonError(null)
+    try {
+      const next = await window.electron.system.daemonStatus()
+      setDaemonStatus(next)
+    } catch (e) {
+      setDaemonError(e instanceof Error ? e.message : String(e))
+      setDaemonStatus(null)
+    } finally {
+      setDaemonLoading(false)
+    }
+  }, [])
+
+  const handleRestartDaemon = useCallback(async () => {
+    setDaemonRestarting(true)
+    setDaemonError(null)
+    try {
+      const next = await window.electron.system.restartDaemon()
+      setDaemonStatus(next)
+    } catch (e) {
+      setDaemonError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDaemonRestarting(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (section !== 'general') return
+    let cancelled = false
+
+    const refresh = async () => {
+      try {
+        const next = await window.electron.system.daemonStatus()
+        if (!cancelled) {
+          setDaemonStatus(next)
+          setDaemonError(null)
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setDaemonError(e instanceof Error ? e.message : String(e))
+          setDaemonStatus(null)
+        }
+      } finally {
+        if (!cancelled) setDaemonLoading(false)
+      }
+    }
+
+    setDaemonLoading(true)
+    void refresh()
+    const interval = window.setInterval(() => {
+      void refresh()
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [section])
 
   // Load workspace MCP servers when MCP section is opened
   useEffect(() => {
@@ -754,6 +830,11 @@ export function SettingsPanel({ onClose, settings: initialSettings, onSettingsCh
         const resolvedUiMode = getThemeById(resolvedThemeId).mode
         const presetOptions = THEME_OPTIONS.filter(o => o.mode === resolvedUiMode)
         const appearanceMode = settings.appearance ?? 'dark'
+        const daemonRunning = daemonStatus?.running === true
+        const daemonInfo = daemonStatus?.info ?? null
+        const daemonStartedLabel = daemonInfo?.startedAt
+          ? new Date(daemonInfo.startedAt).toLocaleString()
+          : 'Unavailable'
         return (
           <>
             <SectionLabel label="Appearance" />
@@ -804,6 +885,91 @@ export function SettingsPanel({ onClose, settings: initialSettings, onSettingsCh
                 ))}
               </select>
             </SettingRow>
+            <SectionLabel label="Daemon" />
+            <SettingRow label="Status" description="The detached CodeSurf daemon persists workspaces, projects, settings, and session indexing outside the renderer.">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: '50%',
+                    background: daemonRunning ? theme.status.success : theme.status.danger,
+                    boxShadow: daemonRunning ? `0 0 8px ${theme.status.success}66` : 'none',
+                    flexShrink: 0,
+                  }}
+                />
+                <span style={{ fontSize: fonts.secondarySize, color: daemonRunning ? theme.text.secondary : theme.status.danger }}>
+                  {daemonLoading
+                    ? 'Checking…'
+                    : daemonRunning
+                      ? `Active${daemonInfo?.pid ? ` · PID ${daemonInfo.pid}` : ''}${daemonInfo?.port ? ` · port ${daemonInfo.port}` : ''}`
+                      : 'Offline'}
+                </span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Runtime" description="Daemon boot time and protocol metadata.">
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+                <span style={{ fontSize: fonts.secondarySize, color: theme.text.secondary }}>
+                  Started {daemonStartedLabel}
+                </span>
+                <span style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled, fontFamily: fonts.mono }}>
+                  protocol {daemonInfo?.protocolVersion ?? '—'} · app {daemonInfo?.appVersion ?? '—'}
+                </span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Control" description="Refresh the status view or restart the daemon without quitting the app.">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => { void loadDaemonStatus() }}
+                  disabled={daemonLoading || daemonRestarting}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    fontSize: fonts.secondarySize,
+                    fontWeight: 600,
+                    border: `1px solid ${theme.border.default}`,
+                    background: theme.surface.input,
+                    color: theme.text.secondary,
+                    cursor: daemonLoading || daemonRestarting ? 'not-allowed' : 'pointer',
+                    opacity: daemonLoading || daemonRestarting ? 0.6 : 1,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <RefreshCw size={14} />
+                  Refresh
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { void handleRestartDaemon() }}
+                  disabled={daemonRestarting}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    fontSize: fonts.secondarySize,
+                    fontWeight: 600,
+                    border: `1px solid ${theme.border.default}`,
+                    background: theme.accent.soft,
+                    color: theme.accent.hover,
+                    cursor: daemonRestarting ? 'not-allowed' : 'pointer',
+                    opacity: daemonRestarting ? 0.6 : 1,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <RotateCcw size={14} />
+                  {daemonRestarting ? 'Restarting…' : 'Restart daemon'}
+                </button>
+              </div>
+            </SettingRow>
+            {daemonError && (
+              <div style={{ fontSize: fonts.secondarySize, color: theme.status.danger, padding: '4px 2px' }}>
+                {daemonError}
+              </div>
+            )}
             <DisplaySettingsEditor
               settings={settings}
               onApply={updateSettingsPatch}
@@ -868,7 +1034,41 @@ export function SettingsPanel({ onClose, settings: initialSettings, onSettingsCh
 
 
       case 'browser':
-        return <ChromeSyncSection settings={settings} onUpdate={update} theme={theme} />
+        return (
+          <>
+            <SectionLabel label="Links" />
+            <SettingRow label="Open links in" description="Choose whether rendered links open in a browser block on the canvas or in your default external browser.">
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {([
+                  { id: 'browser-block', label: 'Browser block' },
+                  { id: 'external-browser', label: 'External browser' },
+                ] as const).map(option => {
+                  const active = (settings.linkOpenMode ?? 'browser-block') === option.id
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => update('linkOpenMode', option.id)}
+                      style={{
+                        padding: '6px 14px',
+                        borderRadius: 8,
+                        fontSize: fonts.secondarySize,
+                        fontWeight: 600,
+                        border: `1px solid ${active ? theme.accent.base : theme.border.default}`,
+                        background: active ? theme.accent.soft : theme.surface.input,
+                        color: active ? theme.accent.hover : theme.text.secondary,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </SettingRow>
+            <ChromeSyncSection settings={settings} onUpdate={update} theme={theme} />
+          </>
+        )
 
       case 'tools':
       case 'mcp': {

@@ -2,6 +2,7 @@ import { ipcMain, BrowserWindow } from 'electron'
 import { getHeapStatistics } from 'v8'
 import { bus } from '../event-bus'
 import { removeTile as removePeerTile } from '../peer-state'
+import { getDaemonStatus, restartDaemon } from '../daemon/manager'
 
 // Debounce GC — if cleanupTile is called many times in quick succession we don't
 // want to hammer global.gc(). Runs ~1s after the last cleanup.
@@ -34,6 +35,32 @@ function runGC(): void {
   }
 }
 
+function sanitizeDaemonState(result: { running: boolean; info: Awaited<ReturnType<typeof getDaemonStatus>>['info'] }): {
+  running: boolean
+  info: {
+    pid: number
+    port: number
+    startedAt: string
+    protocolVersion: number
+    appVersion: string | null
+  } | null
+} {
+  if (!result.info) {
+    return { running: result.running, info: null }
+  }
+
+  return {
+    running: result.running,
+    info: {
+      pid: result.info.pid,
+      port: result.info.port,
+      startedAt: result.info.startedAt,
+      protocolVersion: result.info.protocolVersion,
+      appVersion: result.info.appVersion,
+    },
+  }
+}
+
 export function registerSystemIPC(): void {
   ipcMain.handle('system:cleanupTile', (_, tileId: string) => {
     if (!tileId || typeof tileId !== 'string') return { ok: false }
@@ -63,5 +90,14 @@ export function registerSystemIPC(): void {
       arrayBuffers: mem.arrayBuffers,
       bus: bus.getStats(),
     }
+  })
+
+  ipcMain.handle('system:daemonStatus', async () => {
+    return sanitizeDaemonState(await getDaemonStatus())
+  })
+
+  ipcMain.handle('system:restartDaemon', async () => {
+    const info = await restartDaemon()
+    return sanitizeDaemonState({ running: true, info })
   })
 }

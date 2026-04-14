@@ -484,6 +484,12 @@ app.whenReady().then(async () => {
     app.quit()
   })
 
+  ipcMain.handle('shell:openExternal', async (_, url: string) => {
+    if (typeof url !== 'string' || url.trim().length === 0) return false
+    await shell.openExternal(url)
+    return true
+  })
+
   // Native app menu with Cmd+N / Cmd+T
   const menu = Menu.buildFromTemplate([
     {

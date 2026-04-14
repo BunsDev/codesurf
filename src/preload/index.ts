@@ -238,6 +238,10 @@ contextBridge.exposeInMainWorld('electron', {
     relaunch: () => ipcRenderer.invoke('app:relaunch')
   },
 
+  shell: {
+    openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
+  },
+
   browserTile: {
     sync: (payload: { tileId: string; url: string; mode: 'desktop' | 'mobile'; zIndex: number; visible: boolean; bounds: { left: number; top: number; width: number; height: number } }) =>
       ipcRenderer.invoke('browserTile:sync', payload),
@@ -444,6 +448,8 @@ contextBridge.exposeInMainWorld('electron', {
     cleanupTile: (tileId: string) => ipcRenderer.invoke('system:cleanupTile', tileId),
     gc: () => ipcRenderer.invoke('system:gc'),
     memStats: () => ipcRenderer.invoke('system:memStats'),
+    daemonStatus: () => ipcRenderer.invoke('system:daemonStatus'),
+    restartDaemon: () => ipcRenderer.invoke('system:restartDaemon'),
     onGcRequested: (callback: () => void) => {
       const handler = () => {
         // window.gc exists when renderer is launched with --js-flags=--expose-gc

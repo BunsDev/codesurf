@@ -64,13 +64,15 @@ Implemented now:
 - IPC bridge for list/upsert/delete/resolve
 - settings UI for execution preference and remote host registration
 - router contract for choosing the effective host
+- daemon-backed chat/job execution for `claude` and `codex`
+- persisted `jobs/<job-id>.json` metadata plus append-only `timelines/<job-id>.jsonl`
+- SSE job replay/resume endpoints for local and remote daemon streams
 
 Not implemented yet:
 
-- daemon-owned chat/job execution
-- reconnectable append-only job timelines
+- full provider parity beyond `claude` and `codex`
 - remote repo provisioning
-- remote streaming transport
+- richer remote workspace/environment sync
 
 ## Next phase
 

@@ -182,6 +182,10 @@ interface ChatMessage {
   turns?: number
 }
 
+function shouldRenderToolBlock(block: ToolBlock): boolean {
+  return (block.fileChanges?.length ?? 0) > 0
+}
+
 interface PendingAttachment {
   path: string
   kind: 'image' | 'file'
@@ -2616,135 +2620,138 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             </div>
           )}
  
-          {renderedMessages.map(msg => (
-            <div key={msg.id} style={{
-              display: 'flex', flexDirection: 'column',
-              alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
-              width: msg.role === 'user' ? 'auto' : '100%',
-              maxWidth: msg.role === 'user' ? '60%' : '100%',
-              minWidth: 0,
-              alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-              marginBottom: msg.role === 'user' ? 5 : 0,
-              gap: 6,
-            }}>
-              {/* Thinking block — show immediately when streaming starts */}
-              {(msg.thinking || (msg.isStreaming && !msg.content)) && (
-                <ThinkingBlockView thinking={msg.thinking ?? { content: '', done: false }} />
-              )}
+          {renderedMessages.map(msg => {
+            const visibleToolBlocks = msg.toolBlocks?.filter(shouldRenderToolBlock) ?? []
+            const hasVisibleToolBlocks = visibleToolBlocks.length > 0
+            return (
+              <div key={msg.id} style={{
+                display: 'flex', flexDirection: 'column',
+                alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                width: msg.role === 'user' ? 'auto' : '100%',
+                maxWidth: msg.role === 'user' ? '60%' : '100%',
+                minWidth: 0,
+                alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                marginBottom: msg.role === 'user' ? 5 : 0,
+                gap: 6,
+              }}>
+                {/* Thinking block — show immediately when streaming starts */}
+                {(msg.thinking || (msg.isStreaming && !msg.content)) && (
+                  <ThinkingBlockView thinking={msg.thinking ?? { content: '', done: false }} />
+                )}
 
-              {/* Interleaved content blocks — text and tool calls in stream order */}
-              {(msg.contentBlocks?.length ?? 0) > 0 ? (
-                <>
-                  {(() => {
-                    const elements: JSX.Element[] = []
-                    const blocks = msg.contentBlocks!
-                    let i = 0
-                    while (i < blocks.length) {
-                      const block = blocks[i]
-                      if (block.type === 'tool') {
-                        // Collect consecutive tool blocks into a horizontal row
-                        const toolGroup: JSX.Element[] = []
-                        while (i < blocks.length && blocks[i].type === 'tool') {
-                          const tb = msg.toolBlocks?.find(t => t.id === blocks[i].toolId)
-                          if (tb) toolGroup.push(<ToolBlockView key={tb.id} block={tb} />)
-                          i++
-                        }
-                        if (toolGroup.length > 0) {
+                {/* Interleaved content blocks — text and tool calls in stream order */}
+                {(msg.contentBlocks?.length ?? 0) > 0 ? (
+                  <>
+                    {(() => {
+                      const elements: JSX.Element[] = []
+                      const blocks = msg.contentBlocks!
+                      let i = 0
+                      while (i < blocks.length) {
+                        const block = blocks[i]
+                        if (block.type === 'tool') {
+                          // Collect consecutive tool blocks into a horizontal row
+                          const toolGroup: JSX.Element[] = []
+                          while (i < blocks.length && blocks[i].type === 'tool') {
+                            const tb = msg.toolBlocks?.find(t => t.id === blocks[i].toolId)
+                            if (tb && shouldRenderToolBlock(tb)) toolGroup.push(<ToolBlockView key={tb.id} block={tb} />)
+                            i++
+                          }
+                          if (toolGroup.length > 0) {
+                            elements.push(
+                              <div key={`tools-${i}`} style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-start', alignContent: 'flex-start' }}>
+                                {toolGroup}
+                              </div>
+                            )
+                          }
+                        } else {
+                          const isLastBlock = i === blocks.length - 1
                           elements.push(
-                            <div key={`tools-${i}`} style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-start', alignContent: 'flex-start' }}>
-                              {toolGroup}
+                            <div key={`text-${i}`} style={{
+                              background: msg.role === 'user' ? theme.chat.userBubble : 'transparent',
+                              border: msg.role === 'user' ? `1px solid ${theme.chat.userBubbleBorder}` : '0',
+                              borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
+                              padding: '8px 12px',
+                              fontSize, lineHeight: 1.55,
+                              wordBreak: 'break-word',
+                              color: theme.chat.text, position: 'relative',
+                              width: '100%', minWidth: 0, overflow: 'hidden',
+                            }}>
+                              <ChatMarkdown text={block.text} isStreaming={msg.isStreaming && isLastBlock} />
                             </div>
                           )
+                          i++
                         }
-                      } else {
-                        const isLastBlock = i === blocks.length - 1
-                        elements.push(
-                          <div key={`text-${i}`} style={{
-                            background: msg.role === 'user' ? theme.chat.userBubble : 'transparent',
-                            border: msg.role === 'user' ? `1px solid ${theme.chat.userBubbleBorder}` : '0',
-                            borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
-                            padding: '8px 12px',
-                            fontSize, lineHeight: 1.55,
-                            wordBreak: 'break-word',
-                            color: theme.chat.text, position: 'relative',
-                            width: '100%', minWidth: 0, overflow: 'hidden',
-                          }}>
-                            <ChatMarkdown text={block.text} isStreaming={msg.isStreaming && isLastBlock} />
-                          </div>
-                        )
-                        i++
                       }
-                    }
-                    return elements
-                  })()}
-                </>
-              ) : (
-                <>
-                  {/* Fallback: legacy layout for messages without contentBlocks */}
-                  {msg.toolBlocks && msg.toolBlocks.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-start', alignContent: 'flex-start' }}>
-                      {msg.toolBlocks.map(tb => (
-                        <ToolBlockView key={tb.id} block={tb} />
-                      ))}
-                    </div>
-                  )}
-                  {msg.content && (
-                    <div style={{
-                      background: msg.role === 'user' ? theme.chat.userBubble : 'transparent',
-                      border: msg.role === 'user' ? `1px solid ${theme.chat.userBubbleBorder}` : '0',
-                      borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
-                      padding: '8px 12px',
-                      fontSize, lineHeight: 1.55,
-                      wordBreak: 'break-word',
-                      color: theme.chat.text, position: 'relative',
-                      width: '100%', minWidth: 0, overflow: 'hidden',
-                    }}>
-                      <ChatMarkdown text={msg.content} isStreaming={msg.isStreaming} />
-                      {msg.isStreaming && msg.content.length === 0 && !msg.toolBlocks?.length && (
-                        <WorkingDots />
-                      )}
-                    </div>
-                  )}
-                </>
-              )}
-              {/* Cost/turns/time footer */}
-              {!msg.isStreaming && msg.role === 'assistant' && msg.cost != null && (
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  fontSize: monoSize - 3, color: theme.chat.muted, fontFamily: fontMono,
-                  padding: '0 4px',
-                }}>
-                  <span style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                    <DollarSign size={9} /> ${msg.cost.toFixed(4)}
-                  </span>
-                  {msg.turns != null && (
-                    <span>{msg.turns} turn{msg.turns !== 1 ? 's' : ''}</span>
-                  )}
-                  <span>{relativeTime(msg.timestamp)}</span>
-                </div>
-              )}
-              {/* User message time footer */}
-              {!msg.isStreaming && msg.role === 'user' && (
-                <div style={{
-                  fontSize: monoSize - 3, color: theme.chat.muted, fontFamily: fontMono,
-                  padding: '0 4px', textAlign: 'right',
-                }}>
-                  {relativeTime(msg.timestamp)}
-                </div>
-              )}
+                      return elements
+                    })()}
+                  </>
+                ) : (
+                  <>
+                    {/* Fallback: legacy layout for messages without contentBlocks */}
+                    {hasVisibleToolBlocks && (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-start', alignContent: 'flex-start' }}>
+                        {visibleToolBlocks.map(tb => (
+                          <ToolBlockView key={tb.id} block={tb} />
+                        ))}
+                      </div>
+                    )}
+                    {msg.content && (
+                      <div style={{
+                        background: msg.role === 'user' ? theme.chat.userBubble : 'transparent',
+                        border: msg.role === 'user' ? `1px solid ${theme.chat.userBubbleBorder}` : '0',
+                        borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
+                        padding: '8px 12px',
+                        fontSize, lineHeight: 1.55,
+                        wordBreak: 'break-word',
+                        color: theme.chat.text, position: 'relative',
+                        width: '100%', minWidth: 0, overflow: 'hidden',
+                      }}>
+                        <ChatMarkdown text={msg.content} isStreaming={msg.isStreaming} />
+                        {msg.isStreaming && msg.content.length === 0 && !hasVisibleToolBlocks && (
+                          <WorkingDots />
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+                {/* Cost/turns/time footer */}
+                {!msg.isStreaming && msg.role === 'assistant' && msg.cost != null && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    fontSize: monoSize - 3, color: theme.chat.muted, fontFamily: fontMono,
+                    padding: '0 4px',
+                  }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                      <DollarSign size={9} /> ${msg.cost.toFixed(4)}
+                    </span>
+                    {msg.turns != null && (
+                      <span>{msg.turns} turn{msg.turns !== 1 ? 's' : ''}</span>
+                    )}
+                    <span>{relativeTime(msg.timestamp)}</span>
+                  </div>
+                )}
+                {/* User message time footer */}
+                {!msg.isStreaming && msg.role === 'user' && (
+                  <div style={{
+                    fontSize: monoSize - 3, color: theme.chat.muted, fontFamily: fontMono,
+                    padding: '0 4px', textAlign: 'right',
+                  }}>
+                    {relativeTime(msg.timestamp)}
+                  </div>
+                )}
 
-              {/* Shimmer bar while streaming */}
-              {msg.isStreaming && (
-                <div style={{
-                  height: 2, marginTop: 1, width: '60%', borderRadius: 1,
-                  background: `linear-gradient(90deg, transparent 0%, ${theme.accent.soft} 30%, ${theme.accent.base}88 50%, ${theme.accent.soft} 70%, transparent 100%)`,
-                  backgroundSize: '200% 100%',
-                  animation: 'chat-shimmer 1.5s ease-in-out infinite',
-                  alignSelf: 'flex-start',
-                }} />
-              )}
-            </div>
-          ))}
+                {/* Shimmer bar while streaming */}
+                {msg.isStreaming && (
+                  <div style={{
+                    height: 2, marginTop: 1, width: '60%', borderRadius: 1,
+                    background: `linear-gradient(90deg, transparent 0%, ${theme.accent.soft} 30%, ${theme.accent.base}88 50%, ${theme.accent.soft} 70%, transparent 100%)`,
+                    backgroundSize: '200% 100%',
+                    animation: 'chat-shimmer 1.5s ease-in-out infinite',
+                    alignSelf: 'flex-start',
+                  }} />
+                )}
+              </div>
+          )})}
         </div>
       </div>
 

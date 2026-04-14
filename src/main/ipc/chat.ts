@@ -225,10 +225,26 @@ async function listExecutionHosts(): Promise<ExecutionHostRecord[]> {
   }
 }
 
+function supportsDaemonChatProvider(provider: string | null | undefined): boolean {
+  return provider === 'claude' || provider === 'codex'
+}
+
 async function selectChatExecutionHost(req: ChatRequest): Promise<ExecutionHostRecord | null> {
   const hosts = await listExecutionHosts()
   const settings = readSettingsSync()
   const executionPreference = req.executionPreference ?? settings.execution
+  const provider = String(req.provider ?? '').trim()
+
+  if (!supportsDaemonChatProvider(provider)) {
+    const providerLabel = provider || 'This provider'
+    if (req.executionTarget === 'cloud') {
+      throw new Error(`${providerLabel} does not support remote daemon execution yet. Daemon-backed chat currently supports Claude and Codex only.`)
+    }
+    if (executionPreference.mode === 'daemon-only' || executionPreference.mode === 'specific-host') {
+      throw new Error(`${providerLabel} does not support daemon-backed chat yet. Supported daemon providers: Claude and Codex.`)
+    }
+    return null
+  }
 
   if (req.executionTarget === 'cloud') {
     const remoteHosts = hosts.filter(host => host.type === 'remote-daemon' && host.enabled !== false)

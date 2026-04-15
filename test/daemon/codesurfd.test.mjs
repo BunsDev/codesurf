@@ -1,14 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 
 const ROOT_DIR = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const DAEMON_ENTRY = join(ROOT_DIR, 'bin', 'codesurfd.mjs')
+const TEST_TMP_ROOT = join(ROOT_DIR, '.tmp', 'daemon-tests')
 
 async function waitFor(check, timeoutMs = 5_000, intervalMs = 50) {
   const started = Date.now()
@@ -29,8 +29,13 @@ async function writeJson(filePath, value) {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
 }
 
-async function startDaemon() {
-  const homeDir = await mkdtemp(join(tmpdir(), 'codesurfd-test-'))
+async function makeTestTempDir(prefix) {
+  await mkdir(TEST_TMP_ROOT, { recursive: true })
+  return await mkdtemp(join(TEST_TMP_ROOT, prefix))
+}
+
+async function startDaemon(options = {}) {
+  const homeDir = await makeTestTempDir('codesurfd-test-')
   const pidPath = join(homeDir, 'daemon', 'pid.json')
   const child = spawn(process.execPath, [DAEMON_ENTRY], {
     cwd: ROOT_DIR,
@@ -40,6 +45,7 @@ async function startDaemon() {
       CODESURF_HOME: homeDir,
       CODESURF_DAEMON_PID_PATH: pidPath,
       CODESURF_APP_VERSION: 'test-suite',
+      ...(options.env ?? {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -68,6 +74,21 @@ async function startDaemon() {
     return { status: response.status, payload }
   }
 
+  const requestText = async (path, options = {}) => {
+    const response = await fetch(`http://127.0.0.1:${pidInfo.port}${path}`, {
+      method: options.method ?? 'GET',
+      headers: {
+        Authorization: `Bearer ${pidInfo.token}`,
+        ...(options.headers ?? {}),
+      },
+    })
+    return {
+      status: response.status,
+      body: await response.text(),
+      contentType: response.headers.get('content-type') ?? '',
+    }
+  }
+
   const stop = async () => {
     if (!child.killed) child.kill('SIGTERM')
     await waitFor(async () => child.exitCode !== null || child.signalCode !== null, 5_000, 50).catch(() => null)
@@ -78,7 +99,7 @@ async function startDaemon() {
     }
   }
 
-  return { child, homeDir, pidInfo, request, stop }
+  return { child, homeDir, pidInfo, request, requestText, stop }
 }
 
 test('daemon health endpoint requires auth and returns metadata', async t => {
@@ -95,6 +116,25 @@ test('daemon health endpoint requires auth and returns metadata', async t => {
   assert.equal(payload.ok, true)
   assert.equal(payload.protocolVersion, 1)
   assert.equal(payload.appVersion, 'test-suite')
+})
+
+test('daemon dashboard serves html and query-token auth works', async t => {
+  const daemon = await startDaemon()
+  t.after(async () => {
+    await daemon.stop()
+  })
+
+  const unauth = await fetch(`http://127.0.0.1:${daemon.pidInfo.port}/dashboard`)
+  assert.equal(unauth.status, 401)
+
+  const queryAuth = await fetch(
+    `http://127.0.0.1:${daemon.pidInfo.port}/dashboard?token=${encodeURIComponent(daemon.pidInfo.token)}`,
+  )
+  assert.equal(queryAuth.status, 200)
+  const html = await queryAuth.text()
+  assert.match(queryAuth.headers.get('content-type') ?? '', /text\/html/)
+  assert.match(html, /CodeSurf Daemon Jobs/)
+  assert.match(html, /\/dashboard\/api\/jobs/)
 })
 
 test('daemon manages workspace and project lifecycle through persisted json state', async t => {
@@ -357,7 +397,7 @@ test('daemon persists execution hosts separately from settings and preserves bui
 })
 
 test('daemon migrates legacy config.json into split workspace, project, and settings files', async t => {
-  const homeDir = await mkdtemp(join(tmpdir(), 'codesurfd-legacy-'))
+  const homeDir = await makeTestTempDir('codesurfd-legacy-')
   const legacyConfigPath = join(homeDir, 'config.json')
   await writeJson(legacyConfigPath, {
     settings: {
@@ -428,6 +468,40 @@ test('daemon migrates legacy config.json into split workspace, project, and sett
   assert.equal(settingsDoc.settings.themeMode, 'dark')
   assert.equal(settingsDoc.settings.openLinksIn, 'external')
   assert.deepEqual(hostsDoc.hosts.map(host => host.id), ['local-runtime', 'local-daemon'])
+})
+
+test('daemon chat jobs persist detached background mode in job metadata', async t => {
+  const daemon = await startDaemon()
+  t.after(async () => {
+    await daemon.stop()
+  })
+
+  const response = await daemon.request('/chat/job/start', {
+    body: {
+      request: {
+        cardId: 'chat-1',
+        provider: 'unsupported-provider',
+        model: 'test-model',
+        runMode: 'background',
+        workspaceDir: daemon.homeDir,
+        messages: [
+          { role: 'user', content: 'Do this in the background' },
+        ],
+      },
+    },
+  })
+
+  assert.equal(response.status, 200)
+  assert.equal(response.payload.runMode, 'background')
+  assert.equal(response.payload.status, 'running')
+
+  const completed = await waitFor(async () => {
+    const current = await daemon.request(`/chat/job/state?jobId=${encodeURIComponent(response.payload.id)}`)
+    return current.payload?.status === 'failed' ? current.payload : null
+  }, 5_000, 50)
+
+  assert.equal(completed.runMode, 'background')
+  assert.match(String(completed.error ?? ''), /only implemented for Claude and Codex/i)
 })
 
 test('daemon lists external CodeSurf sessions and invalidates the external-session cache route', async t => {
@@ -571,6 +645,7 @@ test('daemon runs a persisted chat job timeline and replays events for completed
   })
   assert.equal(start.status, 200)
   assert.equal(typeof start.payload.id, 'string')
+  assert.equal(start.payload.taskLabel, 'test daemon execution')
   const jobId = start.payload.id
 
   const state = await waitFor(async () => {
@@ -614,4 +689,129 @@ test('daemon runs a persisted chat job timeline and replays events for completed
   const metadataFile = join(daemon.homeDir, 'jobs', `${jobId}.json`)
   assert.equal(existsSync(timelineFile), true)
   assert.equal(existsSync(metadataFile), true)
+})
+
+test('daemon codex jobs ignore benign stderr and still complete successfully', async t => {
+  const fakeBinDir = await makeTestTempDir('codesurfd-fake-bin-')
+  const fakeCodexPath = join(fakeBinDir, 'codex')
+  await writeFile(fakeCodexPath, `#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-test"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"TEST OK"}}'
+printf '%s\n' 'Reading additional input from stdin...' >&2
+exit 0
+`, 'utf8')
+  await chmod(fakeCodexPath, 0o755)
+
+  const daemon = await startDaemon({
+    env: {
+      PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+    },
+  })
+
+  t.after(async () => {
+    await daemon.stop()
+    await rm(fakeBinDir, { recursive: true, force: true })
+  })
+
+  const start = await daemon.request('/chat/job/start', {
+    body: {
+      request: {
+        provider: 'codex',
+        model: 'gpt-5.4',
+        workspaceDir: daemon.homeDir,
+        messages: [
+          { role: 'user', content: 'test daemon execution' },
+        ],
+      },
+    },
+  })
+
+  assert.equal(start.status, 200)
+  const jobId = start.payload.id
+  assert.equal(start.payload.taskLabel, 'test daemon execution')
+
+  const state = await waitFor(async () => {
+    const next = await daemon.request(`/chat/job/state?jobId=${encodeURIComponent(jobId)}`)
+    return next.payload?.status === 'running' ? null : next
+  })
+
+  assert.equal(state.status, 200)
+  assert.equal(state.payload.status, 'completed')
+  assert.equal(state.payload.error, null)
+  assert.equal(state.payload.sessionId, 'thread-test')
+
+  const timelineFile = join(daemon.homeDir, 'timelines', `${jobId}.jsonl`)
+  const rawTimeline = await readFile(timelineFile, 'utf8')
+  assert.match(rawTimeline, /"type":"session"/)
+  assert.match(rawTimeline, /"type":"text","text":"TEST OK"/)
+  assert.match(rawTimeline, /"type":"done"/)
+  assert.doesNotMatch(rawTimeline, /Reading additional input from stdin/)
+})
+
+test('daemon dashboard job endpoints return recorded jobs and timelines', async t => {
+  const fakeBinDir = await makeTestTempDir('codesurfd-dashboard-bin-')
+  const fakeCodexPath = join(fakeBinDir, 'codex')
+  await writeFile(fakeCodexPath, `#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-dashboard"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"DASHBOARD OK"}}'
+exit 0
+`, 'utf8')
+  await chmod(fakeCodexPath, 0o755)
+
+  const daemon = await startDaemon({
+    env: {
+      PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+    },
+  })
+
+  t.after(async () => {
+    await daemon.stop()
+    await rm(fakeBinDir, { recursive: true, force: true })
+  })
+
+  const start = await daemon.request('/chat/job/start', {
+    body: {
+      request: {
+        provider: 'codex',
+        model: 'gpt-5.4',
+        workspaceDir: daemon.homeDir,
+        messages: [
+          { role: 'user', content: 'dashboard inspection test' },
+        ],
+      },
+    },
+  })
+
+  assert.equal(start.status, 200)
+  const jobId = start.payload.id
+  assert.equal(start.payload.taskLabel, 'dashboard inspection test')
+
+  await waitFor(async () => {
+    const state = await daemon.request(`/chat/job/state?jobId=${encodeURIComponent(jobId)}`)
+    return state.payload?.status === 'completed' ? state : null
+  })
+
+  const jobsResponse = await daemon.request('/dashboard/api/jobs')
+  assert.equal(jobsResponse.status, 200)
+  assert.equal(Array.isArray(jobsResponse.payload.jobs), true)
+  assert.equal(jobsResponse.payload.summary.total > 0, true)
+  assert.equal(jobsResponse.payload.daemon.appVersion, 'test-suite')
+  assert.equal(jobsResponse.payload.jobs.some(job => job.id === jobId), true)
+  assert.equal(
+    jobsResponse.payload.jobs.some(job => job.id === jobId && job.taskLabel === 'dashboard inspection test'),
+    true,
+  )
+
+  const detailResponse = await daemon.request(`/dashboard/api/job?jobId=${encodeURIComponent(jobId)}`)
+  assert.equal(detailResponse.status, 200)
+  assert.equal(detailResponse.payload.job.id, jobId)
+  assert.equal(detailResponse.payload.job.taskLabel, 'dashboard inspection test')
+  assert.equal(detailResponse.payload.job.status, 'completed')
+  assert.equal(Array.isArray(detailResponse.payload.timeline), true)
+  assert.equal(detailResponse.payload.timeline.some(event => event.type === 'text' && event.text === 'DASHBOARD OK'), true)
+
+  const htmlResponse = await daemon.requestText('/dashboard')
+  assert.equal(htmlResponse.status, 200)
+  assert.match(htmlResponse.body, /CodeSurf Daemon Jobs/)
+  assert.match(htmlResponse.body, /refreshAll\(\)/)
 })

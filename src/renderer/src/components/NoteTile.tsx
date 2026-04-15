@@ -20,7 +20,7 @@ interface Props {
  * (the user's own note files). This is NOT used for untrusted external input.
  * HTML entities are escaped first to prevent injection from the source text.
  */
-function renderMarkdown(md: string): string {
+export function renderMarkdown(md: string): string {
   let html = md
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/^### (.+)$/gm, '<h3>$1</h3>')

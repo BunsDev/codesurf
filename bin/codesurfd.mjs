@@ -49,6 +49,23 @@ function readJsonFile(filePath, fallback) {
   }
 }
 
+function sendHtml(res, status, html) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
+  res.end(html)
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
 function emptyLegacyConfig() {
   return {
     version: 2,
@@ -249,6 +266,543 @@ function ensureStateFiles() {
   }
 }
 
+function isActiveJobStatus(status) {
+  return status === 'running' || status === 'starting' || status === 'queued' || status === 'reconnecting'
+}
+
+function readDaemonJobRecords(limit = 100, liveJobIds = new Set()) {
+  const jobsDir = join(HOME, 'jobs')
+  if (!existsSync(jobsDir)) return []
+
+  const records = []
+  for (const entry of readDirNames(jobsDir)) {
+    if (!entry.endsWith('.json')) continue
+    try {
+      const parsed = JSON.parse(readFileSync(join(jobsDir, entry), 'utf8'))
+      if (!parsed || typeof parsed.id !== 'string') continue
+      const rawStatus = typeof parsed.status === 'string' ? parsed.status : 'unknown'
+      const status = isActiveJobStatus(rawStatus) && !liveJobIds.has(parsed.id)
+        ? 'lost'
+        : rawStatus
+      records.push({
+        id: parsed.id,
+        taskLabel: typeof parsed.taskLabel === 'string' ? parsed.taskLabel : null,
+        status,
+        runMode: typeof parsed.runMode === 'string' ? parsed.runMode : 'foreground',
+        workspaceId: typeof parsed.workspaceId === 'string' ? parsed.workspaceId : null,
+        cardId: typeof parsed.cardId === 'string' ? parsed.cardId : null,
+        provider: typeof parsed.provider === 'string' ? parsed.provider : null,
+        model: typeof parsed.model === 'string' ? parsed.model : null,
+        workspaceDir: typeof parsed.workspaceDir === 'string' ? parsed.workspaceDir : null,
+        initialPrompt: typeof parsed.initialPrompt === 'string' ? parsed.initialPrompt : null,
+        requestedAt: typeof parsed.requestedAt === 'string' ? parsed.requestedAt : null,
+        updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null,
+        completedAt: typeof parsed.completedAt === 'string' ? parsed.completedAt : null,
+        lastSequence: typeof parsed.lastSequence === 'number' ? parsed.lastSequence : 0,
+        sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : null,
+        error: typeof parsed.error === 'string' ? parsed.error : null,
+      })
+    } catch {
+      // ignore corrupt metadata
+    }
+  }
+
+  return records
+    .sort((a, b) => {
+      const aTime = a.updatedAt ? Date.parse(a.updatedAt) : 0
+      const bTime = b.updatedAt ? Date.parse(b.updatedAt) : 0
+      return bTime - aTime
+    })
+    .slice(0, limit)
+}
+
+function summarizeDaemonJobs(records) {
+  return records.reduce((acc, record) => {
+    acc.total += 1
+    if (isActiveJobStatus(record.status)) {
+      acc.active += 1
+      if (record.runMode === 'background') acc.backgroundActive += 1
+    } else if (record.status === 'completed') {
+      acc.completed += 1
+    } else if (record.status === 'failed' || record.status === 'lost') {
+      acc.failed += 1
+    } else if (record.status === 'cancelled') {
+      acc.cancelled += 1
+    } else {
+      acc.other += 1
+    }
+    return acc
+  }, {
+    total: 0,
+    active: 0,
+    backgroundActive: 0,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    other: 0,
+  })
+}
+
+function readDaemonJobTimeline(jobId, limit = 200) {
+  const safeId = String(jobId ?? '').trim()
+  if (!safeId || /[\/\\]|\.\./.test(safeId)) return []
+
+  const timelinePath = join(HOME, 'timelines', `${safeId}.jsonl`)
+  if (!existsSync(timelinePath)) return []
+
+  const events = []
+  const raw = readFileSync(timelinePath, 'utf8')
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (parsed && typeof parsed.sequence === 'number') events.push(parsed)
+    } catch {
+      // ignore corrupt timeline entries
+    }
+  }
+  return events.slice(-limit)
+}
+
+function renderDashboardHtml() {
+  const initialJobs = readDaemonJobRecords(50, new Set(chatJobs.listLiveJobIds()))
+  const initialSummary = summarizeDaemonJobs(initialJobs)
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CodeSurf Daemon</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111317;
+        --panel: #171b21;
+        --panel-2: #1d222b;
+        --text: #edf2f7;
+        --muted: #97a3b6;
+        --border: #2a3140;
+        --accent: #79a8ff;
+        --green: #4ad295;
+        --red: #ff7b72;
+        --yellow: #f4c96b;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, #0f1115 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 16px;
+        margin-bottom: 20px;
+      }
+      .title {
+        font-size: 28px;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 6px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.02);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 0 4px rgba(74,210,149,0.12);
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+      .stat {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 14px 16px;
+      }
+      .stat-label {
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .stat-value {
+        font-size: 24px;
+        font-weight: 650;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(420px, 540px) minmax(0, 1fr);
+        gap: 16px;
+        min-height: 620px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        overflow: hidden;
+        min-height: 0;
+      }
+      .panel-header {
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .panel-title {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .jobs {
+        display: flex;
+        flex-direction: column;
+        max-height: 740px;
+        overflow: auto;
+      }
+      .job {
+        width: 100%;
+        text-align: left;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+      }
+      .job:hover, .job.active {
+        background: var(--panel-2);
+      }
+      .job-top, .job-bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+      }
+      .job-top { margin-bottom: 7px; }
+      .job-id {
+        font-size: 13px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .status {
+        padding: 4px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        border: 1px solid var(--border);
+      }
+      .status.running, .status.starting, .status.queued, .status.reconnecting { color: var(--yellow); }
+      .status.completed { color: var(--green); }
+      .status.failed, .status.lost, .status.cancelled { color: var(--red); }
+      .job-meta {
+        color: var(--muted);
+        font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .detail {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        height: 100%;
+      }
+      .detail-body {
+        padding: 16px;
+        display: grid;
+        gap: 14px;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        gap: 8px 12px;
+        align-items: baseline;
+        font-size: 13px;
+      }
+      .kv .k { color: var(--muted); }
+      .mono {
+        font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+        font-size: 12px;
+        word-break: break-word;
+      }
+      .error {
+        color: var(--red);
+        background: rgba(255,123,114,0.08);
+        border: 1px solid rgba(255,123,114,0.22);
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .timeline {
+        border-top: 1px solid var(--border);
+        padding: 0;
+        margin: 0;
+        list-style: none;
+        max-height: 420px;
+        overflow: auto;
+      }
+      .event {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      .event-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 6px;
+      }
+      .event-type {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      .event-seq {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .event-text {
+        color: var(--text);
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .empty {
+        color: var(--muted);
+        padding: 24px 16px;
+        text-align: center;
+      }
+      @media (max-width: 980px) {
+        .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .layout { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="header">
+        <div>
+          <div class="title">CodeSurf Daemon Jobs</div>
+          <div class="sub">Read-only dashboard for daemon-backed chat execution.</div>
+        </div>
+        <div class="pill"><span class="dot"></span><span>Daemon active</span></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="stat-label">Active</div><div class="stat-value" id="stat-active">${initialSummary.active}</div></div>
+        <div class="stat"><div class="stat-label">Completed</div><div class="stat-value" id="stat-completed">${initialSummary.completed}</div></div>
+        <div class="stat"><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed">${initialSummary.failed}</div></div>
+        <div class="stat"><div class="stat-label">Cancelled</div><div class="stat-value" id="stat-cancelled">${initialSummary.cancelled}</div></div>
+        <div class="stat"><div class="stat-label">Total</div><div class="stat-value" id="stat-total">${initialSummary.total}</div></div>
+      </div>
+      <div class="layout">
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Jobs</div>
+            <div class="sub" id="jobs-count">${initialJobs.length} loaded</div>
+          </div>
+          <div class="jobs" id="jobs"></div>
+        </section>
+        <section class="panel detail">
+          <div class="panel-header">
+            <div class="panel-title">Detail</div>
+            <div class="sub" id="detail-updated">Waiting</div>
+          </div>
+          <div class="detail-body" id="detail-body">
+            <div class="empty">Select a job to inspect its timeline.</div>
+          </div>
+          <ul class="timeline" id="timeline"></ul>
+        </section>
+      </div>
+    </div>
+    <script>
+      const token = new URLSearchParams(window.location.search).get('token') || '';
+      const jobsEl = document.getElementById('jobs');
+      const detailBodyEl = document.getElementById('detail-body');
+      const timelineEl = document.getElementById('timeline');
+      const detailUpdatedEl = document.getElementById('detail-updated');
+      const stats = {
+        active: document.getElementById('stat-active'),
+        completed: document.getElementById('stat-completed'),
+        failed: document.getElementById('stat-failed'),
+        cancelled: document.getElementById('stat-cancelled'),
+        total: document.getElementById('stat-total'),
+      };
+      const jobsCountEl = document.getElementById('jobs-count');
+      let selectedJobId = null;
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function fmtTime(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+      }
+
+      async function api(path) {
+        const url = new URL(path, window.location.origin);
+        if (token) url.searchParams.set('token', token);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('Request failed: ' + res.status);
+        return await res.json();
+      }
+
+      function renderJobs(payload) {
+        const jobs = payload.jobs || [];
+        jobsCountEl.textContent = jobs.length + ' loaded';
+        stats.active.textContent = String(payload.summary.active || 0);
+        stats.completed.textContent = String(payload.summary.completed || 0);
+        stats.failed.textContent = String(payload.summary.failed || 0);
+        stats.cancelled.textContent = String(payload.summary.cancelled || 0);
+        stats.total.textContent = String(payload.summary.total || 0);
+
+        if (!selectedJobId && jobs.length) {
+          selectedJobId = jobs[0].id;
+        }
+        if (selectedJobId && !jobs.some(job => job.id === selectedJobId)) {
+          selectedJobId = jobs[0] ? jobs[0].id : null;
+        }
+
+        jobsEl.innerHTML = jobs.length ? jobs.map(job => {
+          const active = job.id === selectedJobId ? ' active' : '';
+          const statusClass = escapeHtml(job.status || 'unknown');
+          return '<button class="job' + active + '" data-job-id="' + escapeHtml(job.id) + '">' +
+            '<div class="job-top">' +
+              '<div class="job-id">' + escapeHtml(job.taskLabel || job.id) + '</div>' +
+              '<div class="status ' + statusClass + '">' + escapeHtml(job.status || 'unknown') + '</div>' +
+            '</div>' +
+            '<div class="job-bottom">' +
+              '<div class="job-meta">' + escapeHtml([job.provider, job.model].filter(Boolean).join(' · ') || 'Unknown provider') + '</div>' +
+              '<div class="job-meta">' + escapeHtml(fmtTime(job.updatedAt)) + '</div>' +
+            '</div>' +
+          '</button>';
+        }).join('') : '<div class="empty">No daemon jobs recorded yet.</div>';
+
+        jobsEl.querySelectorAll('[data-job-id]').forEach(button => {
+          button.addEventListener('click', () => {
+            selectedJobId = button.getAttribute('data-job-id');
+            void refreshDetail();
+            void refreshJobs();
+          });
+        });
+      }
+
+      function renderDetail(payload) {
+        const job = payload.job;
+        const timeline = payload.timeline || [];
+        if (!job) {
+          detailBodyEl.innerHTML = '<div class="empty">Select a job to inspect its timeline.</div>';
+          timelineEl.innerHTML = '';
+          detailUpdatedEl.textContent = 'Waiting';
+          return;
+        }
+
+        detailUpdatedEl.textContent = 'Updated ' + fmtTime(job.updatedAt);
+        detailBodyEl.innerHTML =
+          '<div class="kv">' +
+            '<div class="k">Job</div><div class="mono">' + escapeHtml(job.id) + '</div>' +
+            '<div class="k">Task</div><div>' + escapeHtml(job.taskLabel || '—') + '</div>' +
+            '<div class="k">Status</div><div>' + escapeHtml(job.status || 'unknown') + '</div>' +
+            '<div class="k">Provider</div><div>' + escapeHtml(job.provider || '—') + '</div>' +
+            '<div class="k">Model</div><div>' + escapeHtml(job.model || '—') + '</div>' +
+            '<div class="k">Workspace</div><div class="mono">' + escapeHtml(job.workspaceDir || '—') + '</div>' +
+            '<div class="k">Requested</div><div>' + escapeHtml(fmtTime(job.requestedAt)) + '</div>' +
+            '<div class="k">Completed</div><div>' + escapeHtml(fmtTime(job.completedAt)) + '</div>' +
+            '<div class="k">Session</div><div class="mono">' + escapeHtml(job.sessionId || '—') + '</div>' +
+            '<div class="k">Sequence</div><div>' + escapeHtml(String(job.lastSequence || 0)) + '</div>' +
+          '</div>' +
+          (job.error ? '<div class="error mono">' + escapeHtml(job.error) + '</div>' : '');
+
+        timelineEl.innerHTML = timeline.length ? timeline.map(event => (
+          '<li class="event">' +
+            '<div class="event-top">' +
+              '<div class="event-type">' + escapeHtml(event.type || 'event') + '</div>' +
+              '<div class="event-seq">#' + escapeHtml(String(event.sequence || 0)) + '</div>' +
+            '</div>' +
+            '<div class="event-text mono">' + escapeHtml(
+              event.text || event.error || event.resultText || event.toolName || event.sessionId || JSON.stringify(event)
+            ) + '</div>' +
+          '</li>'
+        )).join('') : '<li class="empty">No timeline recorded yet.</li>';
+      }
+
+      async function refreshJobs() {
+        try {
+          const payload = await api('/dashboard/api/jobs');
+          renderJobs(payload);
+        } catch (error) {
+          jobsEl.innerHTML = '<div class="empty">' + escapeHtml(error.message || String(error)) + '</div>';
+        }
+      }
+
+      async function refreshDetail() {
+        if (!selectedJobId) {
+          renderDetail({ job: null, timeline: [] });
+          return;
+        }
+        try {
+          const payload = await api('/dashboard/api/job?jobId=' + encodeURIComponent(selectedJobId));
+          renderDetail(payload);
+        } catch (error) {
+          detailBodyEl.innerHTML = '<div class="error mono">' + escapeHtml(error.message || String(error)) + '</div>';
+          timelineEl.innerHTML = '';
+        }
+      }
+
+      async function refreshAll() {
+        await refreshJobs();
+        await refreshDetail();
+      }
+
+      void refreshAll();
+      window.setInterval(() => { void refreshAll(); }, 3000);
+    </script>
+  </body>
+</html>`
+}
+
 function readWorkspaceState() {
   ensureStateFiles()
   const workspaceDoc = readJsonFile(WORKSPACES_FILE, { version: 1, activeWorkspaceId: null, workspaces: [] })
@@ -353,6 +907,17 @@ function sessionTitleFromText(text, provider) {
   return trimmed.split(/\r?\n/, 1)[0].slice(0, 80)
 }
 
+function extractSessionTitle(messages, provider) {
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue
+    const role = typeof message.role === 'string' ? message.role : ''
+    const text = truncateSessionText(typeof message.content === 'string' ? message.content : null)
+    if (!text) continue
+    if (role === 'user') return sessionTitleFromText(text, provider)
+  }
+  return null
+}
+
 function extractTileSessionSummary(tileId, state) {
   if (!state || typeof state !== 'object') return null
   const record = state
@@ -384,7 +949,7 @@ function extractTileSessionSummary(tileId, state) {
     model,
     messageCount: messages.length,
     lastMessage,
-    title: sessionTitleFromText(lastMessage, provider),
+    title: extractSessionTitle(messages, provider) ?? sessionTitleFromText(lastMessage, provider),
     updatedAt: Date.now(),
   }
 }
@@ -445,69 +1010,336 @@ function deleteExternalSession(codesurfHome, workspacePath, sessionEntryId) {
 
 function listLocalWorkspaceSessions(workspaceId) {
   const dotDir = workspaceContexDir(workspaceId)
-  if (!existsSync(dotDir)) return []
-
   const entries = []
-  for (const name of readDirNames(dotDir)) {
-    if (!name.startsWith('tile-state-') || !name.endsWith('.json')) continue
+  if (existsSync(dotDir)) {
+    for (const name of readDirNames(dotDir)) {
+      if (!name.startsWith('tile-state-') || !name.endsWith('.json')) continue
 
-    const filePath = join(dotDir, name)
-    const tileId = name.replace('tile-state-', '').replace('.json', '')
-    const summaryPath = tileSessionSummaryPath(workspaceId, tileId)
+      const filePath = join(dotDir, name)
+      const tileId = name.replace('tile-state-', '').replace('.json', '')
+      const summaryPath = tileSessionSummaryPath(workspaceId, tileId)
 
-    let summary = readJsonFile(summaryPath, null)
-    if (!summary) {
-      const state = readJsonFile(filePath, null)
-      if (!state) continue
-      summary = extractTileSessionSummary(tileId, state)
-      if (!summary) continue
-      try {
-        const stat = statSync(filePath)
-        summary.updatedAt = stat.mtimeMs
-      } catch {}
-      atomicWriteJson(summaryPath, summary)
+      let summary = readJsonFile(summaryPath, null)
+      if (!summary) {
+        const state = readJsonFile(filePath, null)
+        if (!state) continue
+        summary = extractTileSessionSummary(tileId, state)
+        if (!summary) continue
+        try {
+          const stat = statSync(filePath)
+          summary.updatedAt = stat.mtimeMs
+        } catch {}
+        atomicWriteJson(summaryPath, summary)
+      }
+
+      entries.push({
+        id: `codesurf-tile:${name}`,
+        source: 'codesurf',
+        scope: 'workspace',
+        tileId,
+        sessionId: summary.sessionId ?? null,
+        provider: summary.provider ?? 'claude',
+        model: summary.model ?? '',
+        messageCount: Number(summary.messageCount ?? 0),
+        lastMessage: summary.lastMessage ?? null,
+        updatedAt: Number(summary.updatedAt ?? Date.now()),
+        title: summary.title ?? sessionTitleFromText(summary.lastMessage ?? null, summary.provider ?? 'claude'),
+        filePath,
+        projectPath: resolveWorkspaceProjectPath(workspaceId, null),
+        sourceLabel: 'CodeSurf',
+        sourceDetail: summary.provider || 'Workspace chat',
+        canOpenInChat: true,
+        canOpenInApp: false,
+        nestingLevel: 0,
+      })
     }
-
-    entries.push({
-      id: `codesurf-tile:${name}`,
-      source: 'codesurf',
-      scope: 'workspace',
-      tileId,
-      sessionId: summary.sessionId ?? null,
-      provider: summary.provider ?? 'claude',
-      model: summary.model ?? '',
-      messageCount: Number(summary.messageCount ?? 0),
-      lastMessage: summary.lastMessage ?? null,
-      updatedAt: Number(summary.updatedAt ?? Date.now()),
-      title: summary.title ?? sessionTitleFromText(summary.lastMessage ?? null, summary.provider ?? 'claude'),
-      filePath,
-      sourceLabel: 'CodeSurf',
-      sourceDetail: summary.provider || 'Workspace chat',
-      canOpenInChat: true,
-      canOpenInApp: false,
-      nestingLevel: 0,
-    })
   }
+
+  entries.push(...listDaemonWorkspaceSessions(workspaceId, entries))
 
   entries.sort((a, b) => b.updatedAt - a.updatedAt)
   return entries
 }
 
 function getLocalSessionState(workspaceId, sessionEntryId) {
-  if (!String(sessionEntryId).startsWith('codesurf-tile:')) return null
-  const tileId = String(sessionEntryId).replace('codesurf-tile:tile-state-', '').replace('.json', '')
-  return readJsonFile(tileStatePath(workspaceId, tileId), null)
+  const normalizedId = String(sessionEntryId)
+  if (normalizedId.startsWith('codesurf-tile:')) {
+    const tileId = normalizedId.replace('codesurf-tile:tile-state-', '').replace('.json', '')
+    return readJsonFile(tileStatePath(workspaceId, tileId), null)
+  }
+  if (normalizedId.startsWith('codesurf-job:')) {
+    const jobId = normalizedId.replace('codesurf-job:', '')
+    return buildDaemonSessionState(jobId, workspaceId)
+  }
+  return null
 }
 
 function deleteLocalSession(workspaceId, sessionEntryId) {
-  if (!String(sessionEntryId).startsWith('codesurf-tile:')) return { ok: false, error: 'Unsupported local session id' }
-  const tileId = String(sessionEntryId).replace('codesurf-tile:tile-state-', '').replace('.json', '')
-  const filePath = tileStatePath(workspaceId, tileId)
-  if (!pathExists(filePath)) return { ok: false, error: 'Session file missing' }
+  const normalizedId = String(sessionEntryId)
+  if (normalizedId.startsWith('codesurf-tile:')) {
+    const tileId = normalizedId.replace('codesurf-tile:tile-state-', '').replace('.json', '')
+    const filePath = tileStatePath(workspaceId, tileId)
+    if (!pathExists(filePath)) return { ok: false, error: 'Session file missing' }
 
-  moveFileToDeleted(filePath)
-  rmSync(tileSessionSummaryPath(workspaceId, tileId), { force: true })
-  return { ok: true }
+    moveFileToDeleted(filePath)
+    rmSync(tileSessionSummaryPath(workspaceId, tileId), { force: true })
+    return { ok: true }
+  }
+  if (normalizedId.startsWith('codesurf-job:')) {
+    const jobId = normalizedId.replace('codesurf-job:', '')
+    const metadata = readDaemonJobRecord(jobId)
+    if (!metadata) return { ok: false, error: 'Job not found' }
+    rmSync(join(HOME, 'jobs', `${jobId}.json`), { force: true })
+    rmSync(join(HOME, 'timelines', `${jobId}.jsonl`), { force: true })
+    return { ok: true }
+  }
+  return { ok: false, error: 'Unsupported local session id' }
+}
+
+function readDaemonJobRecord(jobId) {
+  const safeId = String(jobId ?? '').trim()
+  if (!safeId || /[\/\\]|\.\./.test(safeId)) return null
+  const records = readDaemonJobRecords(500, new Set(chatJobs.listLiveJobIds()))
+  return records.find(record => record.id === safeId) ?? null
+}
+
+function resolveWorkspaceProjectPath(workspaceId, fallbackPath = null) {
+  const state = readWorkspaceState()
+  const workspace = state.workspaces.find(entry => entry.id === workspaceId)
+  if (!workspace) return normalizePath(fallbackPath)
+  const materialized = materializeWorkspace(workspace, state.projects)
+  const projectPaths = [
+    materialized.path,
+    ...(Array.isArray(materialized.projectPaths) ? materialized.projectPaths : []),
+  ]
+    .map(path => normalizePath(path))
+    .filter(Boolean)
+  return projectPaths[0] ?? normalizePath(fallbackPath)
+}
+
+function listDaemonWorkspaceSessions(workspaceId, existingEntries) {
+  const state = readWorkspaceState()
+  const workspace = state.workspaces.find(entry => entry.id === workspaceId)
+  if (!workspace) return []
+
+  const materialized = materializeWorkspace(workspace, state.projects)
+  const workspacePaths = new Set([
+    materialized.path,
+    ...(Array.isArray(materialized.projectPaths) ? materialized.projectPaths : []),
+  ].map(path => normalizePath(path)).filter(Boolean))
+  if (workspacePaths.size === 0) return []
+
+  const seenSessionIds = new Set(existingEntries.map(entry => entry.sessionId).filter(Boolean))
+  const seenTileIds = new Set(existingEntries.map(entry => entry.tileId).filter(Boolean))
+  const liveJobIds = new Set(chatJobs.listLiveJobIds())
+  const jobs = readDaemonJobRecords(200, liveJobIds)
+  const now = Date.now()
+
+  return jobs
+    .filter(job => {
+      if (job.workspaceId && job.workspaceId !== workspaceId) return false
+      const normalizedWorkspaceDir = normalizePath(job.workspaceDir)
+      if (!normalizedWorkspaceDir || !workspacePaths.has(normalizedWorkspaceDir)) return false
+      if (job.cardId && seenTileIds.has(job.cardId)) return false
+      if (job.sessionId && seenSessionIds.has(job.sessionId)) return false
+      if (job.status === 'cancelled') return false
+      if (isActiveJobStatus(job.status) || job.status === 'lost') return true
+      const updatedAt = job.updatedAt ? Date.parse(job.updatedAt) : 0
+      return updatedAt > 0 && (now - updatedAt) <= 24 * 60 * 60 * 1000
+    })
+    .map(job => ({
+      id: `codesurf-job:${job.id}`,
+      source: 'codesurf',
+      scope: 'workspace',
+      tileId: job.cardId ?? null,
+      sessionId: job.sessionId ?? null,
+      provider: job.provider ?? 'claude',
+      model: job.model ?? '',
+      messageCount: 2,
+      lastMessage: job.taskLabel ?? job.initialPrompt ?? `${job.provider ?? 'Agent'} task`,
+      updatedAt: job.updatedAt ? Date.parse(job.updatedAt) : Date.now(),
+      title: sessionTitleFromText(job.initialPrompt ?? job.taskLabel, job.provider ?? 'claude'),
+      projectPath: normalizedWorkspaceDirOrNull(job.workspaceDir),
+      sourceLabel: 'CodeSurf',
+      sourceDetail: `${job.provider ?? 'Agent'} daemon`,
+      canOpenInChat: true,
+      canOpenInApp: false,
+      nestingLevel: 0,
+    }))
+}
+
+function normalizedWorkspaceDirOrNull(workspaceDir) {
+  const normalized = normalizePath(workspaceDir)
+  return normalized || null
+}
+
+function buildDaemonSessionState(jobId, workspaceId) {
+  const metadata = readDaemonJobRecord(jobId)
+  if (!metadata) return null
+
+  const timeline = readDaemonJobTimeline(jobId, 400)
+  const requestedAt = metadata.requestedAt ? Date.parse(metadata.requestedAt) : Date.now()
+  const initialPrompt = String(metadata.initialPrompt ?? metadata.taskLabel ?? `${metadata.provider ?? 'Agent'} task`).trim()
+  const userMessage = {
+    id: `job-${jobId}-user`,
+    role: 'user',
+    content: initialPrompt,
+    timestamp: Number.isFinite(requestedAt) ? requestedAt : Date.now(),
+  }
+  const assistantMessage = {
+    id: `job-${jobId}-assistant`,
+    role: 'assistant',
+    content: '',
+    timestamp: Number.isFinite(requestedAt) ? requestedAt + 1 : Date.now(),
+    isStreaming: isActiveJobStatus(metadata.status),
+    toolBlocks: [],
+    contentBlocks: [],
+  }
+
+  for (const event of timeline) {
+    if (!event || typeof event !== 'object') continue
+    if (typeof event.sessionId === 'string') metadata.sessionId = event.sessionId
+
+    switch (event.type) {
+      case 'text': {
+        if (typeof event.text !== 'string' || !event.text) break
+        assistantMessage.content += event.text
+        const lastBlock = assistantMessage.contentBlocks[assistantMessage.contentBlocks.length - 1]
+        if (lastBlock?.type === 'text') {
+          lastBlock.text += event.text
+        } else {
+          assistantMessage.contentBlocks.push({ type: 'text', text: event.text })
+        }
+        break
+      }
+      case 'thinking_start':
+        assistantMessage.thinking = { content: '', done: false }
+        break
+      case 'thinking':
+        if (typeof event.text === 'string' && event.text) {
+          assistantMessage.thinking = {
+            content: `${assistantMessage.thinking?.content ?? ''}${event.text}`,
+            done: false,
+          }
+        }
+        break
+      case 'tool_start': {
+        const toolId = typeof event.toolId === 'string' && event.toolId ? event.toolId : `tool-${assistantMessage.toolBlocks.length + 1}`
+        assistantMessage.toolBlocks.push({
+          id: toolId,
+          name: typeof event.toolName === 'string' && event.toolName ? event.toolName : 'tool',
+          input: '',
+          status: 'running',
+        })
+        assistantMessage.contentBlocks.push({ type: 'tool', toolId })
+        break
+      }
+      case 'tool_input': {
+        if (typeof event.text !== 'string') break
+        const targetIndex = typeof event.toolId === 'string'
+          ? assistantMessage.toolBlocks.findIndex(block => block.id === event.toolId)
+          : assistantMessage.toolBlocks.length - 1
+        if (targetIndex >= 0) {
+          assistantMessage.toolBlocks[targetIndex].input += event.text
+        }
+        break
+      }
+      case 'tool_use': {
+        const targetIndex = typeof event.toolId === 'string'
+          ? assistantMessage.toolBlocks.findIndex(block => block.id === event.toolId)
+          : assistantMessage.toolBlocks.findIndex(block => block.status === 'running')
+        if (targetIndex >= 0) {
+          assistantMessage.toolBlocks[targetIndex] = {
+            ...assistantMessage.toolBlocks[targetIndex],
+            name: typeof event.toolName === 'string' && event.toolName ? event.toolName : assistantMessage.toolBlocks[targetIndex].name,
+            input: typeof event.toolInput === 'string' ? event.toolInput : assistantMessage.toolBlocks[targetIndex].input,
+            status: 'done',
+          }
+        }
+        break
+      }
+      case 'tool_summary': {
+        const targetIndex = typeof event.toolId === 'string'
+          ? assistantMessage.toolBlocks.findIndex(block => block.id === event.toolId)
+          : assistantMessage.toolBlocks.findIndex(block => block.status === 'running')
+        if (targetIndex >= 0) {
+          assistantMessage.toolBlocks[targetIndex] = {
+            ...assistantMessage.toolBlocks[targetIndex],
+            name: typeof event.toolName === 'string' && event.toolName ? event.toolName : assistantMessage.toolBlocks[targetIndex].name,
+            summary: typeof event.text === 'string' ? event.text : assistantMessage.toolBlocks[targetIndex].summary,
+            fileChanges: Array.isArray(event.fileChanges) ? event.fileChanges : assistantMessage.toolBlocks[targetIndex].fileChanges,
+            commandEntries: Array.isArray(event.commandEntries) ? event.commandEntries : assistantMessage.toolBlocks[targetIndex].commandEntries,
+            status: 'done',
+          }
+        }
+        break
+      }
+      case 'tool_progress': {
+        const targetIndex = assistantMessage.toolBlocks.findIndex(block => block.status === 'running' && block.name === event.toolName)
+        if (targetIndex >= 0 && typeof event.elapsed === 'number') {
+          assistantMessage.toolBlocks[targetIndex] = {
+            ...assistantMessage.toolBlocks[targetIndex],
+            elapsed: event.elapsed,
+          }
+        }
+        break
+      }
+      case 'block_stop': {
+        if (assistantMessage.thinking) {
+          assistantMessage.thinking = { ...assistantMessage.thinking, done: true }
+        }
+        const lastRunningIndex = assistantMessage.toolBlocks.findLastIndex(block => block.status === 'running')
+        if (lastRunningIndex >= 0) {
+          assistantMessage.toolBlocks[lastRunningIndex] = {
+            ...assistantMessage.toolBlocks[lastRunningIndex],
+            status: 'done',
+          }
+        }
+        break
+      }
+      case 'error':
+        if (!assistantMessage.content && typeof event.error === 'string' && event.error) {
+          assistantMessage.content = `Error: ${event.error}`
+          assistantMessage.contentBlocks.push({ type: 'text', text: assistantMessage.content })
+        }
+        assistantMessage.isStreaming = false
+        break
+      case 'done':
+        assistantMessage.isStreaming = false
+        break
+    }
+  }
+
+  if (metadata.error && !assistantMessage.content) {
+    assistantMessage.content = `Error: ${metadata.error}`
+    assistantMessage.contentBlocks.push({ type: 'text', text: assistantMessage.content })
+  }
+  if (!assistantMessage.content && assistantMessage.contentBlocks.length === 0 && assistantMessage.toolBlocks.length === 0) {
+    assistantMessage.content = assistantMessage.isStreaming ? '' : 'No output captured yet.'
+    if (assistantMessage.content) {
+      assistantMessage.contentBlocks.push({ type: 'text', text: assistantMessage.content })
+    }
+  }
+
+  return {
+    messages: [userMessage, assistantMessage],
+    input: '',
+    attachments: [],
+    provider: metadata.provider ?? 'claude',
+    model: metadata.model ?? '',
+    mcpEnabled: true,
+    mode: metadata.provider === 'codex' ? 'full-auto' : 'default',
+    thinking: 'adaptive',
+    agentMode: false,
+    autoAgentMode: false,
+    sessionId: metadata.sessionId ?? null,
+    jobId: metadata.id,
+    jobSequence: Number(metadata.lastSequence ?? 0),
+    cloudHostId: null,
+    isStreaming: isActiveJobStatus(metadata.status),
+    executionTarget: 'local',
+    workspaceId,
+  }
 }
 
 function readDirNames(dirPath) {
@@ -617,20 +1449,67 @@ function parseRequestBody(req) {
   })
 }
 
-function authorized(req) {
-  return req.headers.authorization === `Bearer ${AUTH_TOKEN}`
+function authorized(req, url) {
+  if (req.headers.authorization === `Bearer ${AUTH_TOKEN}`) return true
+  const token = String(url?.searchParams?.get('token') ?? '').trim()
+  return token.length > 0 && token === AUTH_TOKEN
 }
 
 const server = createServer(async (req, res) => {
-  if (!authorized(req)) {
+  const url = new URL(req.url || '/', 'http://127.0.0.1')
+
+  if (!authorized(req, url)) {
     sendJson(res, 401, { error: 'Unauthorized' })
     return
   }
-
-  const url = new URL(req.url || '/', 'http://127.0.0.1')
   const method = req.method || 'GET'
 
   try {
+    if (method === 'GET' && url.pathname === '/dashboard') {
+      sendHtml(res, 200, renderDashboardHtml())
+      return
+    }
+
+    if (method === 'GET' && url.pathname === '/dashboard/api/jobs') {
+      const jobs = readDaemonJobRecords(100, new Set(chatJobs.listLiveJobIds()))
+      sendJson(res, 200, {
+        jobs,
+        summary: summarizeDaemonJobs(jobs),
+        daemon: {
+          pid: process.pid,
+          startedAt: STARTED_AT,
+          appVersion: APP_VERSION,
+        },
+      })
+      return
+    }
+
+    if (method === 'GET' && url.pathname === '/dashboard/api/job') {
+      const jobId = String(url.searchParams.get('jobId') ?? '').trim()
+      if (!jobId) {
+        sendJson(res, 400, { error: 'jobId is required' })
+        return
+      }
+
+      const job = await chatJobs.getJobState(jobId)
+      if (!job) {
+        sendJson(res, 404, { error: 'Job not found' })
+        return
+      }
+      const effectiveJob = {
+        ...job,
+        status: isActiveJobStatus(job.status) && !chatJobs.listLiveJobIds().includes(jobId)
+          ? 'lost'
+          : job.status,
+      }
+
+      sendJson(res, 200, {
+        job: effectiveJob,
+        timeline: readDaemonJobTimeline(jobId, 200),
+      })
+      return
+    }
+
     if (method === 'GET' && url.pathname === '/health') {
       sendJson(res, 200, {
         ok: true,

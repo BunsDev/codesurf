@@ -28,22 +28,33 @@ type DaemonSummary = DaemonStatus & {
   jobs: {
     total: number
     active: number
+    backgroundActive: number
     completed: number
     failed: number
     cancelled: number
     other: number
     recent: Array<{
       id: string
+      taskLabel: string | null
       status: string
+      runMode: string | null
+      workspaceId: string | null
+      cardId: string | null
       provider: string | null
       model: string | null
       workspaceDir: string | null
+      sessionId: string | null
+      initialPrompt: string | null
       updatedAt: string | null
       requestedAt: string | null
       lastSequence: number
       error: string | null
     }>
   }
+}
+
+type DaemonTaskRow = DaemonSummary['jobs']['recent'][number] & {
+  runCount: number
 }
 
 const REFRESH_MS = 1500
@@ -85,7 +96,51 @@ function statusTone(theme: ReturnType<typeof useTheme>, status: string): string 
   return theme.text.disabled
 }
 
-export function MainStatusBar(): React.JSX.Element {
+function jobGroupKey(job: DaemonSummary['jobs']['recent'][number]): string {
+  const sessionKey = String(job.sessionId ?? '').trim()
+  if (sessionKey) return `session:${sessionKey}`
+
+  const taskLabel = String(job.taskLabel ?? job.initialPrompt ?? '').trim().toLowerCase()
+  const provider = String(job.provider ?? '').trim().toLowerCase()
+  const model = String(job.model ?? '').trim().toLowerCase()
+  const workspaceDir = String(job.workspaceDir ?? '').trim().toLowerCase()
+  return `task:${taskLabel}::${provider}::${model}::${workspaceDir}`
+}
+
+function summarizeDaemonTaskRows(items: DaemonSummary['jobs']['recent']): DaemonTaskRow[] {
+  const grouped = new Map<string, DaemonTaskRow>()
+
+  for (const job of items) {
+    const key = jobGroupKey(job)
+    const existing = grouped.get(key)
+    if (!existing) {
+      grouped.set(key, { ...job, runCount: 1 })
+      continue
+    }
+
+    existing.runCount += 1
+    const existingTime = Date.parse(existing.updatedAt ?? existing.requestedAt ?? '') || 0
+    const nextTime = Date.parse(job.updatedAt ?? job.requestedAt ?? '') || 0
+    if (nextTime > existingTime) {
+      grouped.set(key, { ...job, runCount: existing.runCount })
+    }
+  }
+
+  return [...grouped.values()].sort((a, b) => {
+    const aActive = a.status === 'running' || a.status === 'starting' || a.status === 'queued' || a.status === 'reconnecting' ? 1 : 0
+    const bActive = b.status === 'running' || b.status === 'starting' || b.status === 'queued' || b.status === 'reconnecting' ? 1 : 0
+    if (aActive !== bActive) return bActive - aActive
+    const aTime = Date.parse(a.updatedAt ?? a.requestedAt ?? '') || 0
+    const bTime = Date.parse(b.updatedAt ?? b.requestedAt ?? '') || 0
+    return bTime - aTime
+  })
+}
+
+interface MainStatusBarProps {
+  onOpenDaemonTask?: (task: DaemonSummary['jobs']['recent'][number]) => void
+}
+
+export function MainStatusBar({ onOpenDaemonTask }: MainStatusBarProps): React.JSX.Element {
   const theme = useTheme()
   const fonts = useAppFonts()
   const [stats, setStats] = useState<MemoryStats | null>(null)
@@ -139,7 +194,6 @@ export function MainStatusBar(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
-    if (!showDaemonSummary) return
     let cancelled = false
 
     const load = () => {
@@ -152,11 +206,14 @@ export function MainStatusBar(): React.JSX.Element {
 
     load()
     const interval = window.setInterval(load, DAEMON_REFRESH_MS)
+    const onFocus = () => load()
+    window.addEventListener('focus', onFocus)
     return () => {
       cancelled = true
       window.clearInterval(interval)
+      window.removeEventListener('focus', onFocus)
     }
-  }, [showDaemonSummary])
+  }, [])
 
   useEffect(() => {
     if (!showDaemonSummary) return
@@ -195,9 +252,6 @@ export function MainStatusBar(): React.JSX.Element {
   const title = stats
     ? `Main heap ${formatBytes(usage.heapUsed)} / ${formatBytes(usage.heapLimit || usage.heapTotal)} - RSS ${formatBytes(stats.rss)} - external ${formatBytes(stats.external)}`
     : 'Loading memory stats'
-  const daemonTitle = daemon?.running
-    ? `CodeSurf daemon active - PID ${daemon.info?.pid ?? 'unknown'} - port ${daemon.info?.port ?? 'unknown'}`
-    : 'CodeSurf daemon offline'
   const daemonColor = daemon == null
     ? theme.text.disabled
     : daemon.running
@@ -208,6 +262,23 @@ export function MainStatusBar(): React.JSX.Element {
     : daemon.running
       ? theme.status.success
       : theme.status.danger
+  const daemonActiveJobCount = daemonSummary?.jobs.active ?? 0
+  const daemonBackgroundJobCount = daemonSummary?.jobs.backgroundActive ?? 0
+  const daemonStatusLabel = daemon?.running
+    ? (daemonActiveJobCount > 0 ? 'ACTIVE' : 'READY')
+    : daemon == null
+      ? 'DAEMON'
+      : 'OFFLINE'
+  const daemonStatusDetail = daemon?.running && daemonBackgroundJobCount > 0
+    ? `${daemonBackgroundJobCount} BG`
+    : null
+  const summarizedTasks = useMemo(() => summarizeDaemonTaskRows(daemonSummary?.jobs.recent ?? []), [daemonSummary?.jobs.recent])
+  const daemonStatusTextColor = daemon?.running && daemonActiveJobCount > 0
+    ? theme.text.primary
+    : daemonColor
+  const daemonTitle = daemon?.running
+    ? `CodeSurf daemon ${daemonActiveJobCount > 0 ? 'active' : 'ready'}${daemonBackgroundJobCount > 0 ? ` - ${daemonBackgroundJobCount} background task${daemonBackgroundJobCount === 1 ? '' : 's'}` : ''} - PID ${daemon.info?.pid ?? 'unknown'} - port ${daemon.info?.port ?? 'unknown'}`
+    : 'CodeSurf daemon offline'
 
   return (
     <div
@@ -285,9 +356,14 @@ export function MainStatusBar(): React.JSX.Element {
                 flexShrink: 0,
               }}
             />
-            <span style={{ color: daemonColor }}>
-              {daemon?.running ? 'Daemon active' : daemon == null ? 'Daemon' : 'Daemon offline'}
+            <span style={{ color: daemonStatusTextColor, fontWeight: 700, letterSpacing: 0.5 }}>
+              {daemonStatusLabel}
             </span>
+            {daemonStatusDetail && (
+              <span style={{ color: theme.text.secondary, fontWeight: 600, letterSpacing: 0.3 }}>
+                {daemonStatusDetail}
+              </span>
+            )}
           </button>
           {showDaemonSummary && (
             <div
@@ -311,7 +387,7 @@ export function MainStatusBar(): React.JSX.Element {
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
                   <span style={{ fontSize: fonts.secondarySize, fontWeight: 700, color: theme.text.primary }}>
-                    Daemon summary
+                    {daemonActiveJobCount > 0 ? 'Active tasks' : 'Daemon summary'}
                   </span>
                   <span style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled }}>
                     {daemonSummary?.running
@@ -337,9 +413,10 @@ export function MainStatusBar(): React.JSX.Element {
                 </button>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginBottom: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 8, marginBottom: 12 }}>
                 {[
                   { label: 'Active', value: daemonSummary?.jobs.active ?? 0, color: theme.status.success },
+                  { label: 'Bg', value: daemonSummary?.jobs.backgroundActive ?? 0, color: theme.accent.base },
                   { label: 'Done', value: daemonSummary?.jobs.completed ?? 0, color: theme.text.secondary },
                   { label: 'Failed', value: daemonSummary?.jobs.failed ?? 0, color: theme.status.danger },
                   { label: 'Total', value: daemonSummary?.jobs.total ?? 0, color: theme.text.primary },
@@ -366,11 +443,16 @@ export function MainStatusBar(): React.JSX.Element {
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-                  Recent jobs
+                  Tasks
                 </div>
-                {daemonSummary?.jobs.recent.length ? daemonSummary.jobs.recent.map(job => (
-                  <div
+                {summarizedTasks.length ? summarizedTasks.map(job => (
+                  <button
+                    type="button"
                     key={job.id}
+                    onClick={() => {
+                      onOpenDaemonTask?.(job)
+                      setShowDaemonSummary(false)
+                    }}
                     style={{
                       background: theme.surface.panelMuted,
                       border: `1px solid ${theme.border.subtle}`,
@@ -379,25 +461,47 @@ export function MainStatusBar(): React.JSX.Element {
                       display: 'flex',
                       flexDirection: 'column',
                       gap: 4,
+                      width: '100%',
+                      textAlign: 'left',
+                      cursor: onOpenDaemonTask ? 'pointer' : 'default',
+                      appearance: 'none',
+                      font: 'inherit',
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                      <span style={{ fontSize: fonts.secondarySize, color: theme.text.primary, fontWeight: 600, textTransform: 'capitalize' }}>
-                        {job.provider ?? 'Unknown'} · {job.model ?? 'Unknown model'}
+                      <span
+                        style={{
+                          fontSize: fonts.secondarySize,
+                          color: theme.text.primary,
+                          fontWeight: 600,
+                          minWidth: 0,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={job.taskLabel ?? job.id}
+                      >
+                        {job.taskLabel ?? `${job.provider ?? 'Unknown'} task`}
                       </span>
                       <span style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: statusTone(theme, job.status), textTransform: 'capitalize' }}>
                         {job.status}
                       </span>
                     </div>
                     <div style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled }}>
+                      {[job.provider, job.model].filter(Boolean).join(' · ') || 'Unknown provider'}
+                    </div>
+                    <div style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled }}>
                       {job.workspaceDir ?? 'No workspace'} · {formatRelativeTime(job.updatedAt ?? job.requestedAt)}
                     </div>
-                    {job.error && (
-                      <div style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.status.danger, lineHeight: 1.35 }}>
-                        {job.error}
-                      </div>
-                    )}
-                  </div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <span style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.text.disabled }}>
+                        {job.runCount > 1 ? `${job.runCount} runs` : '1 run'}
+                      </span>
+                      <span style={{ fontSize: Math.max(10, fonts.secondarySize - 1), color: theme.accent.base }}>
+                        Open task
+                      </span>
+                    </div>
+                  </button>
                 )) : (
                   <div
                     style={{
@@ -417,11 +521,7 @@ export function MainStatusBar(): React.JSX.Element {
           )}
         </div>
 
-        <span style={{ color: theme.text.secondary, textTransform: 'uppercase', letterSpacing: 0.8, fontSize: Math.max(9, fonts.secondarySize - 3) }}>
-          Memory
-        </span>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1, maxWidth: 320 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1, maxWidth: 240, overflow: 'hidden' }}>
           <div
             style={{
               position: 'relative',

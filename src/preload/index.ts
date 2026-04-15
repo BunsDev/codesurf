@@ -174,6 +174,7 @@ contextBridge.exposeInMainWorld('electron', {
       provider: string
       model: string
       messages: { role: string; content: string }[]
+      runMode?: 'foreground' | 'background'
       negotiatedTools?: string[]
       peers?: { peerId: string; peerType: string; tools: string[] }[]
       providerTransport?: import('../shared/types').ExtensionChatTransportConfig | null

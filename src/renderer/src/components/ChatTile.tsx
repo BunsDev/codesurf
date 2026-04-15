@@ -183,7 +183,11 @@ interface ChatMessage {
 }
 
 function shouldRenderToolBlock(block: ToolBlock): boolean {
-  return (block.fileChanges?.length ?? 0) > 0
+  return block.status === 'running'
+    || (block.fileChanges?.length ?? 0) > 0
+    || (block.commandEntries?.length ?? 0) > 0
+    || Boolean(block.summary?.trim())
+    || Boolean(block.input?.trim())
 }
 
 interface PendingAttachment {
@@ -295,7 +299,8 @@ const CHAT_TRIM_NOTICE_PREFIX = '[CodeSurf memory guard]'
 const CHAT_COMPOSER_MAX_WIDTH = CHAT_MESSAGE_MAX_WIDTH
 const CHAT_COMPOSER_MIN_WIDTH = 400
 const CHAT_COMPOSER_SIDE_INSET = 24
-const CHAT_COMPOSER_DRAWER_INDENT = 20
+const CHAT_COMPOSER_WIDTH = `min(calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px), ${CHAT_COMPOSER_MAX_WIDTH}px)`
+const CHAT_COMPOSER_MIN_WIDTH_STYLE = `min(${CHAT_COMPOSER_MIN_WIDTH}px, calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px))`
 const CHAT_COMPOSER_MIN_HEIGHT = 105
 const CHAT_COMPOSER_TEXTAREA_MIN_HEIGHT = 56
 const CHAT_AUTO_SCROLL_THRESHOLD = 48
@@ -425,6 +430,172 @@ function buildQueuedTurnPreview(content: string, attachmentCount: number): strin
   if (truncated) return truncated
   if (attachmentCount > 0) return `Queued attachment${attachmentCount === 1 ? '' : 's'}`
   return 'Queued follow-up'
+}
+
+const RECENT_EDIT_CONTEXT_FILE_LIMIT = 3
+const RECENT_EDIT_CONTEXT_SNIPPET_LINE_LIMIT = 24
+const RECENT_EDIT_CONTEXT_SURROUNDING_LINES = 4
+const RECENT_EDIT_CONTEXT_MAX_CHARS = 5000
+
+function shouldAttachRecentEditContext(userText: string): boolean {
+  const normalized = userText.trim()
+  if (!normalized) return false
+  if (normalized.length > 320) return false
+
+  const hasEditIntent = /\b(edit|change|adjust|tweak|move|nudge|shift|raise|lower|increase|decrease|reduce|make|set|resize|align|position|offset|widen|narrow|shorten|lengthen|bigger|smaller|higher|lower)\b/i.test(normalized)
+    || /\b\d+(?:px|rem|em|%)\b/i.test(normalized)
+  const refersToExistingThing = /\b(it|that|those|them|this|same|again|more|further|another|still|also|back|left|right|up|down|higher|lower|bigger|smaller)\b/i.test(normalized)
+  return hasEditIntent && refersToExistingThing
+}
+
+function resolveEditedFilePath(filePath: string, workspaceDir: string): string {
+  const trimmed = String(filePath ?? '').trim()
+  if (!trimmed) return trimmed
+  if (trimmed.startsWith('/')) return trimmed
+  return `${workspaceDir.replace(/\/+$/, '')}/${trimmed.replace(/^\/+/, '')}`
+}
+
+function extractChangedLineRangesFromDiff(diff: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = []
+  for (const line of String(diff ?? '').split('\n')) {
+    const match = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/)
+    if (!match) continue
+    const start = Number(match[1] ?? '0')
+    const count = Number(match[2] ?? '1')
+    if (!Number.isFinite(start) || start <= 0) continue
+    const safeCount = Number.isFinite(count) && count > 0 ? count : 1
+    ranges.push({ start, end: start + safeCount - 1 })
+  }
+  return ranges
+}
+
+function buildSnippetFromRanges(fileContent: string, ranges: Array<{ start: number; end: number }>): string {
+  const lines = String(fileContent ?? '').split(/\r?\n/)
+  if (lines.length === 0) return ''
+  const windows = ranges.length > 0
+    ? ranges.slice(0, 3)
+    : [{ start: 1, end: Math.min(lines.length, 8) }]
+
+  const merged: Array<{ start: number; end: number }> = []
+  for (const range of windows) {
+    const next = {
+      start: Math.max(1, range.start - RECENT_EDIT_CONTEXT_SURROUNDING_LINES),
+      end: Math.min(lines.length, range.end + RECENT_EDIT_CONTEXT_SURROUNDING_LINES),
+    }
+    const previous = merged[merged.length - 1]
+    if (previous && next.start <= previous.end + 2) {
+      previous.end = Math.max(previous.end, next.end)
+    } else {
+      merged.push(next)
+    }
+  }
+
+  let emittedLines = 0
+  const parts: string[] = []
+  for (const range of merged) {
+    if (emittedLines >= RECENT_EDIT_CONTEXT_SNIPPET_LINE_LIMIT) break
+    if (parts.length > 0) parts.push('...')
+    for (let lineNumber = range.start; lineNumber <= range.end; lineNumber += 1) {
+      if (emittedLines >= RECENT_EDIT_CONTEXT_SNIPPET_LINE_LIMIT) {
+        parts.push('...')
+        break
+      }
+      parts.push(`${lineNumber}: ${lines[lineNumber - 1] ?? ''}`)
+      emittedLines += 1
+    }
+  }
+  return parts.join('\n').trim()
+}
+
+async function buildRecentEditContext(messages: ChatMessage[], workspaceDir: string, userText: string): Promise<string | null> {
+  if (!shouldAttachRecentEditContext(userText) || !workspaceDir.trim() || !window.electron?.fs?.readFile) return null
+
+  const seenPaths = new Set<string>()
+  const recentChanges: Array<{ displayPath: string; resolvedPath: string; diff: string; changeType: string }> = []
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (message.role !== 'assistant') continue
+    const toolBlocks = message.toolBlocks ?? []
+    for (let blockIndex = toolBlocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = toolBlocks[blockIndex]
+      for (const change of [...(block.fileChanges ?? [])].reverse()) {
+        const resolvedPath = resolveEditedFilePath(change.path, workspaceDir)
+        if (!resolvedPath || seenPaths.has(resolvedPath)) continue
+        seenPaths.add(resolvedPath)
+        recentChanges.push({
+          displayPath: change.path,
+          resolvedPath,
+          diff: change.diff,
+          changeType: change.changeType,
+        })
+        if (recentChanges.length >= RECENT_EDIT_CONTEXT_FILE_LIMIT) break
+      }
+      if (recentChanges.length >= RECENT_EDIT_CONTEXT_FILE_LIMIT) break
+    }
+    if (recentChanges.length >= RECENT_EDIT_CONTEXT_FILE_LIMIT) break
+  }
+
+  if (recentChanges.length === 0) return null
+
+  const sections: string[] = []
+  for (const change of recentChanges) {
+    try {
+      const fileContent = await window.electron.fs.readFile(change.resolvedPath)
+      const snippet = buildSnippetFromRanges(fileContent, extractChangedLineRangesFromDiff(change.diff))
+      if (!snippet) continue
+      sections.push(
+        `File: ${change.displayPath}\n` +
+        `Recent change type: ${change.changeType}\n` +
+        `Current nearby code:\n${snippet}`,
+      )
+    } catch {
+      // If the file no longer exists or can't be read, skip it quietly.
+    }
+  }
+
+  if (sections.length === 0) return null
+
+  const combined =
+    'Recent edit context from the immediately previous implementation pass. Use this only as fast-follow context if the user is referring to the same change area.\n\n'
+    + sections.join('\n\n---\n\n')
+
+  if (combined.length <= RECENT_EDIT_CONTEXT_MAX_CHARS) return combined
+  return `${combined.slice(0, RECENT_EDIT_CONTEXT_MAX_CHARS - 1).trimEnd()}…`
+}
+
+function splitMessageAttachmentPaths(text: string): {
+  bodyText: string
+  attachmentPaths: string[]
+} {
+  const marker = 'Attached file paths:'
+  const normalized = String(text ?? '')
+  const attachmentMarkerIndex = normalized.indexOf(marker)
+  if (attachmentMarkerIndex < 0) {
+    return {
+      bodyText: normalized,
+      attachmentPaths: [],
+    }
+  }
+
+  const bodyText = normalized.slice(0, attachmentMarkerIndex).trim()
+  const attachmentText = normalized.slice(attachmentMarkerIndex + marker.length).trim()
+  const attachmentPaths = attachmentText
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  if (attachmentPaths.length === 0) {
+    return {
+      bodyText: normalized,
+      attachmentPaths: [],
+    }
+  }
+
+  return {
+    bodyText,
+    attachmentPaths,
+  }
 }
 
 function truncateTextForMemory(text: string | undefined, limit: number, label: string): string {
@@ -724,6 +895,94 @@ const ChatMarkdown = React.memo(({ text, isStreaming, className }: {
   )
 })
 
+const ChatMessageContent = React.memo(({
+  text,
+  isStreaming,
+  isUser,
+  className,
+}: {
+  text: string
+  isStreaming?: boolean
+  isUser?: boolean
+  className?: string
+}) => {
+  const theme = useTheme()
+  const fonts = useAppFonts()
+  const { bodyText, attachmentPaths } = useMemo(() => splitMessageAttachmentPaths(text), [text])
+  const chipBackground = isUser
+    ? 'rgba(255,255,255,0.1)'
+    : theme.surface.panelMuted
+  const chipBorder = isUser
+    ? 'rgba(255,255,255,0.18)'
+    : theme.border.subtle
+  const chipText = isUser
+    ? '#f8fbff'
+    : theme.text.primary
+  const chipMeta = isUser
+    ? 'rgba(255,255,255,0.72)'
+    : theme.text.disabled
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: bodyText && attachmentPaths.length > 0 ? 12 : 0, minWidth: 0, width: '100%' }}>
+      {bodyText ? (
+        <ChatMarkdown text={bodyText} isStreaming={isStreaming} className={className} />
+      ) : null}
+      {attachmentPaths.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: Math.max(10, fonts.secondarySize - 1),
+              color: chipMeta,
+              fontWeight: 600,
+              letterSpacing: 0.2,
+            }}
+          >
+            Attached file paths
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, minWidth: 0 }}>
+            {attachmentPaths.map(path => (
+              <button
+                key={path}
+                type="button"
+                title={path}
+                onClick={() => { void dispatchOpenLink(path) }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  minWidth: 0,
+                  maxWidth: '100%',
+                  borderRadius: 999,
+                  border: `1px solid ${chipBorder}`,
+                  background: chipBackground,
+                  color: chipText,
+                  padding: '6px 10px',
+                  cursor: 'pointer',
+                }}
+              >
+                <FileText size={12} style={{ flexShrink: 0, opacity: 0.8 }} />
+                <span
+                  style={{
+                    minWidth: 0,
+                    maxWidth: 320,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontSize: Math.max(11, fonts.size - 1),
+                    lineHeight: 1.2,
+                  }}
+                >
+                  {basename(path)}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
 // --- Provider / Model config -----------------------------------------------------
 
 type BuiltinProvider = 'claude' | 'codex' | 'opencode' | 'openclaw' | 'hermes'
@@ -798,8 +1057,8 @@ const PROVIDER_MODES: Record<BuiltinProvider, ModeOption[]> = {
     { id: 'read-only', label: 'Read Only', description: 'No file modifications', color: '#58a6ff' },
   ],
   opencode: [
-    { id: 'build', label: 'Build', description: 'Execute and build code', color: '#ffb432' },
     { id: 'plan', label: 'Plan', description: 'Plan only, no execution', color: '#58a6ff' },
+    { id: 'build', label: 'Build', description: 'Execute and build code', color: '#ffb432' },
   ],
   openclaw: [
     { id: 'full-auto', label: 'Full Auto', description: 'Full auto, no approval', color: '#e54d2e' },
@@ -2261,6 +2520,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
   const dispatchMessageContent = useCallback(async (messageContent: string): Promise<boolean> => {
     const trimmedContent = messageContent.trim()
     if (!trimmedContent) return false
+    const { bodyText: userBodyText } = splitMessageAttachmentPaths(trimmedContent)
 
     const state = latestStateRef.current
     const activeProvider = state?.provider ?? provider
@@ -2281,8 +2541,39 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
       content: trimmedContent,
       timestamp: Date.now(),
     }
+    const assistantId = `msg-${Date.now() + 1}`
+    const optimisticMessages = normalizeMessagesForMemory([
+      ...activeMessages,
+      userMsg,
+      {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        isStreaming: true,
+      },
+    ])
+    const optimisticState: ChatTilePersistedState = {
+      messages: optimisticMessages,
+      input: '',
+      attachments: [],
+      queuedTurns: state?.queuedTurns ?? queuedTurns,
+      executionTarget: state?.executionTarget ?? executionTarget,
+      provider: activeProvider,
+      model: activeModel,
+      mcpEnabled: activeMcpEnabled,
+      mode: activeMode,
+      thinking: activeThinking,
+      agentMode: state?.agentMode ?? effectiveAgentMode,
+      autoAgentMode: state?.autoAgentMode ?? autoAgentMode,
+      sessionId: activeSessionId,
+      jobId: null,
+      jobSequence: 0,
+      cloudHostId: nextCloudHostId,
+      isStreaming: true,
+    }
 
-    setMessagesSafe(prev => [...prev, userMsg])
+    setMessagesSafe(optimisticMessages)
     setIsStreaming(true)
     setJobId(null)
     setJobSequence(0)
@@ -2290,17 +2581,26 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
     resumedJobKeyRef.current = null
     stickToBottomRef.current = true
     focusComposer()
+    latestStateRef.current = optimisticState
+    persistLatestState(optimisticState)
 
     window.electron?.bus?.publish(`tile:${tileId}`, 'activity', `chat:${tileId}`, {
       message: `User: ${userMsg.content.slice(0, 100)}`, role: 'user',
     })
 
-    const assistantId = `msg-${Date.now() + 1}`
-    setMessagesSafe(prev => [...prev, {
-      id: assistantId, role: 'assistant', content: '', timestamp: Date.now(), isStreaming: true,
-    }])
-
     try {
+      const recentEditContext = await buildRecentEditContext(activeMessages, _workspaceDir, userBodyText)
+      const requestMessages = [...activeMessages, userMsg].map((message, index, allMessages) => {
+        const isNewestUserMessage = index === allMessages.length - 1 && message.id === userMsg.id
+        if (!isNewestUserMessage || !recentEditContext) {
+          return { role: message.role, content: message.content }
+        }
+        return {
+          role: message.role,
+          content: `${message.content}\n\n---\nRecent edit context:\n${recentEditContext}`.trim(),
+        }
+      })
+
       const peers = activeMcpEnabled ? connectedPeers.map(p => ({
         peerId: p.peerId,
         peerType: p.peerType,
@@ -2311,6 +2611,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
 
       const result = await window.electron?.chat?.send({
         cardId: tileId,
+        workspaceId,
         provider: activeProvider,
         model: activeModel,
         providerTransport: activeProviderEntry?.transport ?? null,
@@ -2320,19 +2621,29 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
         executionTarget,
         cloudHostId: nextCloudHostId,
         executionPreference: settings?.execution ?? null,
-        messages: [...activeMessages, userMsg].map(m => ({ role: m.role, content: m.content })),
+        messages: requestMessages,
         negotiatedTools: activeMcpEnabled ? peerToolNames : undefined,
         peers: peers.length > 0 ? peers : undefined,
         sessionId: activeSessionId,
       })
       if (result && typeof result === 'object' && 'jobId' in result && typeof (result as { jobId?: unknown }).jobId === 'string') {
-        setJobId((result as { jobId: string }).jobId)
+        const nextJobId = (result as { jobId: string }).jobId
+        setJobId(nextJobId)
         setJobSequence(0)
         lastJobSequenceRef.current = 0
+        const nextState = {
+          ...optimisticState,
+          jobId: nextJobId,
+          jobSequence: 0,
+        }
+        latestStateRef.current = nextState
+        persistLatestState(nextState)
       } else {
         setJobId(null)
         setJobSequence(0)
         lastJobSequenceRef.current = 0
+        latestStateRef.current = optimisticState
+        persistLatestState(optimisticState)
       }
       return true
     } catch (err) {
@@ -2343,7 +2654,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
       focusComposer()
       return false
     }
-  }, [provider, model, mode, thinking, sessionId, mcpEnabled, messages, providerEntryById, currentProviderEntry, tileId, connectedPeers, _workspaceDir, executionTarget, cloudHostId, activeCloudHost, settings?.execution, peerToolNames, focusComposer, setMessagesSafe])
+  }, [provider, model, mode, thinking, sessionId, mcpEnabled, messages, providerEntryById, currentProviderEntry, tileId, connectedPeers, _workspaceDir, executionTarget, cloudHostId, activeCloudHost, settings?.execution, peerToolNames, focusComposer, setMessagesSafe, queuedTurns, effectiveAgentMode, autoAgentMode, persistLatestState])
 
   const queueCurrentDraft = useCallback(() => {
     const messageContent = buildOutgoingMessageContent(input, attachments)
@@ -2676,7 +2987,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
                               color: theme.chat.text, position: 'relative',
                               width: '100%', minWidth: 0, overflow: 'hidden',
                             }}>
-                              <ChatMarkdown text={block.text} isStreaming={msg.isStreaming && isLastBlock} />
+                              <ChatMessageContent text={block.text} isStreaming={msg.isStreaming && isLastBlock} isUser={msg.role === 'user'} />
                             </div>
                           )
                           i++
@@ -2706,7 +3017,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
                         color: theme.chat.text, position: 'relative',
                         width: '100%', minWidth: 0, overflow: 'hidden',
                       }}>
-                        <ChatMarkdown text={msg.content} isStreaming={msg.isStreaming} />
+                        <ChatMessageContent text={msg.content} isStreaming={msg.isStreaming} isUser={msg.role === 'user'} />
                         {msg.isStreaming && msg.content.length === 0 && !hasVisibleToolBlocks && (
                           <WorkingDots />
                         )}
@@ -2755,218 +3066,222 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
         </div>
       </div>
 
-      {latestChangeSummary && (
-        <div style={{
-          flexShrink: 0,
-          width: `min(calc(100% - ${(CHAT_COMPOSER_SIDE_INSET + CHAT_COMPOSER_DRAWER_INDENT) * 2}px), ${CHAT_COMPOSER_MAX_WIDTH - CHAT_COMPOSER_DRAWER_INDENT * 2}px)`,
-          minWidth: `min(${Math.max(260, CHAT_COMPOSER_MIN_WIDTH - CHAT_COMPOSER_DRAWER_INDENT * 2)}px, calc(100% - ${(CHAT_COMPOSER_SIDE_INSET + CHAT_COMPOSER_DRAWER_INDENT) * 2}px))`,
-          margin: '0 auto -1px auto',
-          border: `1px solid ${theme.chat.divider}`,
-          borderBottom: 'none',
-          borderRadius: '18px 18px 0 0',
-          background: theme.surface.panelMuted,
-          boxShadow: theme.shadow.panel,
-          overflow: 'hidden',
-          position: 'relative',
-          zIndex: 1,
-        }}>
+      <div style={{ flexShrink: 0, position: 'relative', overflow: 'visible' }}>
+        {showScrollToLatest && (
           <div style={{
+            position: 'absolute',
+            top: 0,
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
             display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-            padding: '10px 14px',
-            ...NON_SELECTABLE_UI_STYLE,
+            justifyContent: 'center',
+            pointerEvents: 'none',
+            zIndex: 3,
           }}>
-            <div style={{
-              display: 'flex',
-              alignItems: 'baseline',
-              gap: 8,
-              minWidth: 0,
-              color: theme.chat.textSecondary,
-              fontFamily: fontSans,
-            }}>
-              <span style={{ fontSize: 13, fontWeight: 500 }}>
-                {latestChangeSummary.fileCount} file{latestChangeSummary.fileCount === 1 ? '' : 's'} changed
-              </span>
-              <span style={{ fontSize: 13, fontWeight: 600, color: theme.status.success }}>
-                +{latestChangeSummary.additions}
-              </span>
-              <span style={{ fontSize: 13, fontWeight: 600, color: theme.status.danger }}>
-                -{latestChangeSummary.deletions}
-              </span>
-            </div>
             <button
-              type="button"
-              onClick={reviewLatestChanges}
+              onClick={() => scrollToLatest()}
+              title="Jump to latest"
               style={{
-                border: 'none',
-                background: 'transparent',
-                color: theme.chat.text,
-                fontSize: 13,
-                fontFamily: fontSans,
-                fontWeight: 500,
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                padding: 0,
-                flexShrink: 0,
-                ...NON_SELECTABLE_UI_STYLE,
-              }}
-            >
-              <span>Review changes</span>
-              <ChevronRight size={13} />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {queuedTurns.length > 0 && (
-        <div style={{
-          flexShrink: 0,
-          width: `min(calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px), ${CHAT_COMPOSER_MAX_WIDTH}px)`,
-          minWidth: `min(${CHAT_COMPOSER_MIN_WIDTH}px, calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px))`,
-          margin: latestChangeSummary ? '0 auto 0 auto' : '0 auto 0 auto',
-          border: `1px solid ${theme.chat.divider}`,
-          borderTop: latestChangeSummary ? 'none' : `1px solid ${theme.chat.divider}`,
-          borderRadius: latestChangeSummary ? '0 0 18px 18px' : 18,
-          background: theme.surface.panelElevated,
-          boxShadow: theme.shadow.panel,
-          overflow: 'hidden',
-        }}>
-          {queuedTurns.map((turn, index) => (
-            <div
-              key={turn.id}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                padding: '16px 18px',
-                borderTop: index > 0 ? `1px solid ${theme.chat.divider}` : undefined,
-              }}
-            >
-              <div style={{
-                width: 18,
-                height: 18,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                color: theme.chat.muted,
-                flexShrink: 0,
+                width: 30,
+                height: 30,
+                minWidth: 30,
+                padding: 0,
+                borderRadius: '50%',
+                border: `1px solid ${theme.chat.divider}`,
+                background: theme.surface.panelElevated,
+                color: theme.text.secondary,
+                cursor: 'pointer',
+                boxShadow: theme.shadow.panel,
+                backdropFilter: 'blur(10px)',
+                pointerEvents: 'auto',
                 ...NON_SELECTABLE_UI_STYLE,
+              }}
+            >
+              <ArrowDown size={15} strokeWidth={1.8} />
+            </button>
+          </div>
+        )}
+
+        {latestChangeSummary && (
+          <div style={{
+            flexShrink: 0,
+            width: CHAT_COMPOSER_WIDTH,
+            minWidth: CHAT_COMPOSER_MIN_WIDTH_STYLE,
+            margin: '0 auto -1px auto',
+            border: `1px solid ${theme.chat.divider}`,
+            borderBottom: 'none',
+            borderRadius: '18px 18px 0 0',
+            background: theme.surface.panelMuted,
+            boxShadow: theme.shadow.panel,
+            overflow: 'hidden',
+            position: 'relative',
+            zIndex: 1,
+          }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              padding: '10px 14px',
+              ...NON_SELECTABLE_UI_STYLE,
+            }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'baseline',
+                gap: 8,
+                minWidth: 0,
+                color: theme.chat.textSecondary,
+                fontFamily: fontSans,
               }}>
-                <MessageSquare size={14} />
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{
-                  color: theme.chat.textSecondary,
-                  fontSize: Math.max(13, fontSize + 1),
-                  fontFamily: fontSans,
-                  lineHeight: 1.35,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {turn.preview}
-                </div>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>
+                  {latestChangeSummary.fileCount} file{latestChangeSummary.fileCount === 1 ? '' : 's'} changed
+                </span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: theme.status.success }}>
+                  +{latestChangeSummary.additions}
+                </span>
+                <span style={{ fontSize: 13, fontWeight: 600, color: theme.status.danger }}>
+                  -{latestChangeSummary.deletions}
+                </span>
               </div>
               <button
                 type="button"
-                onClick={() => {
-                  if (isStreaming) return
-                  setQueuedTurns(prev => prev.filter(item => item.id !== turn.id))
-                  void dispatchMessageContent(turn.content)
-                }}
-                disabled={isStreaming}
+                onClick={reviewLatestChanges}
                 style={{
                   border: 'none',
                   background: 'transparent',
-                  color: isStreaming ? theme.chat.muted : theme.chat.textSecondary,
+                  color: theme.chat.text,
                   fontSize: 13,
                   fontFamily: fontSans,
-                  cursor: isStreaming ? 'default' : 'pointer',
+                  fontWeight: 500,
+                  cursor: 'pointer',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 4,
                   padding: 0,
-                  opacity: isStreaming ? 0.45 : 1,
                   flexShrink: 0,
                   ...NON_SELECTABLE_UI_STYLE,
                 }}
               >
-                <span>Steer</span>
+                <span>Review changes</span>
                 <ChevronRight size={13} />
               </button>
-              <button
-                type="button"
-                onClick={() => setQueuedTurns(prev => prev.filter(item => item.id !== turn.id))}
+            </div>
+          </div>
+        )}
+
+        {queuedTurns.length > 0 && (
+          <div style={{
+            flexShrink: 0,
+            width: CHAT_COMPOSER_WIDTH,
+            minWidth: CHAT_COMPOSER_MIN_WIDTH_STYLE,
+            margin: latestChangeSummary ? '0 auto 0 auto' : '0 auto 0 auto',
+            border: `1px solid ${theme.chat.divider}`,
+            borderTop: latestChangeSummary ? 'none' : `1px solid ${theme.chat.divider}`,
+            borderRadius: latestChangeSummary ? '0 0 18px 18px' : 18,
+            background: theme.surface.panelElevated,
+            boxShadow: theme.shadow.panel,
+            overflow: 'hidden',
+          }}>
+            {queuedTurns.map((turn, index) => (
+              <div
+                key={turn.id}
                 style={{
-                  border: 'none',
-                  background: 'transparent',
-                  color: theme.chat.muted,
-                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '16px 18px',
+                  borderTop: index > 0 ? `1px solid ${theme.chat.divider}` : undefined,
+                }}
+              >
+                <div style={{
+                  width: 18,
+                  height: 18,
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  padding: 0,
+                  color: theme.chat.muted,
                   flexShrink: 0,
                   ...NON_SELECTABLE_UI_STYLE,
-                }}
-                title="Remove queued message"
-              >
-                <Trash2 size={14} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+                }}>
+                  <MessageSquare size={14} />
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{
+                    color: theme.chat.textSecondary,
+                    fontSize: Math.max(13, fontSize + 1),
+                    fontFamily: fontSans,
+                    lineHeight: 1.35,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {turn.preview}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isStreaming) return
+                    setQueuedTurns(prev => prev.filter(item => item.id !== turn.id))
+                    void dispatchMessageContent(turn.content)
+                  }}
+                  disabled={isStreaming}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    color: isStreaming ? theme.chat.muted : theme.chat.textSecondary,
+                    fontSize: 13,
+                    fontFamily: fontSans,
+                    cursor: isStreaming ? 'default' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    padding: 0,
+                    opacity: isStreaming ? 0.45 : 1,
+                    flexShrink: 0,
+                    ...NON_SELECTABLE_UI_STYLE,
+                  }}
+                >
+                  <span>Steer</span>
+                  <ChevronRight size={13} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setQueuedTurns(prev => prev.filter(item => item.id !== turn.id))}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    color: theme.chat.muted,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: 0,
+                    flexShrink: 0,
+                    ...NON_SELECTABLE_UI_STYLE,
+                  }}
+                  title="Remove queued message"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
-      {showScrollToLatest && (
+        {/* Input bar */}
         <div style={{
           flexShrink: 0,
-          width: `min(calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px), ${CHAT_COMPOSER_MAX_WIDTH}px)`,
-          minWidth: `min(${CHAT_COMPOSER_MIN_WIDTH}px, calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px))`,
+          width: CHAT_COMPOSER_WIDTH,
+          minWidth: CHAT_COMPOSER_MIN_WIDTH_STYLE,
           margin: '0 auto 6px auto',
           display: 'flex',
-          justifyContent: 'center',
+          flexDirection: 'column',
+          gap: 6,
         }}>
-          <button
-            onClick={() => scrollToLatest()}
-            title="Jump to latest"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 30,
-              height: 30,
-              minWidth: 30,
-              padding: 0,
-              borderRadius: '50%',
-              border: `1px solid ${theme.chat.divider}`,
-              background: theme.surface.panelElevated,
-              color: theme.text.secondary,
-              cursor: 'pointer',
-              boxShadow: theme.shadow.panel,
-              backdropFilter: 'blur(10px)',
-              ...NON_SELECTABLE_UI_STYLE,
-            }}
-          >
-            <ArrowDown size={15} strokeWidth={1.8} />
-          </button>
-        </div>
-      )}
-
-      {/* Input bar */}
-      <div style={{
-        flexShrink: 0,
-        width: `min(calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px), ${CHAT_COMPOSER_MAX_WIDTH}px)`,
-        minWidth: `min(${CHAT_COMPOSER_MIN_WIDTH}px, calc(100% - ${CHAT_COMPOSER_SIDE_INSET * 2}px))`,
-        margin: '0 auto 6px auto',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 6,
-      }}>
         <div style={{
         minHeight: CHAT_COMPOSER_MIN_HEIGHT,
         border: isDropTarget ? `1px solid ${theme.accent.base}` : `1px solid ${composerBorder}`, borderRadius: 14,
@@ -3308,6 +3623,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
               <FooterPill
                 prefix={executionTarget === 'local' ? <LocalProjectIcon /> : <CloudProjectIcon />}
                 label={locationLabel}
+                color={theme.chat.muted}
                 active={showLocationMenu}
                 onClick={() => toggleMenu('location')}
               />
@@ -3372,6 +3688,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
               <FooterPill
                 prefix={<BranchIcon />}
                 label={isGitRepo ? currentBranchLabel : projectFolderName}
+                color={theme.chat.muted}
                 active={showBranchMenu}
                 onClick={() => toggleMenu('branch')}
               />
@@ -3601,6 +3918,7 @@ export function ChatTile({ tileId, workspaceId, workspaceDir: _workspaceDir, wid
             </div>
           </div>
         </div>
+        </div>
       </div>
     </div>
     </FontCtx.Provider>
@@ -3635,15 +3953,15 @@ function ThinkingBlockView({ thinking }: { thinking: ThinkingBlock }): JSX.Eleme
         onClick={() => hasContent && setExpanded(e => !e)}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 6,
-          padding: '5px 10px 5px 8px',
-          background: expanded ? theme.surface.selection : 'transparent',
-          border: expanded ? `1px solid ${theme.surface.selectionBorder}` : '1px solid transparent',
+          padding: '2px 0',
+          background: 'transparent',
+          border: 'none',
           cursor: hasContent ? 'pointer' : 'default',
           color: isActive ? theme.accent.hover : theme.chat.muted,
           fontSize: 12, fontFamily: fonts.sans, fontWeight: 500,
-          borderRadius: expanded ? '8px 8px 0 0' : 8,
+          borderRadius: 0,
           lineHeight: 1,
-          backdropFilter: expanded ? 'blur(8px)' : 'none',
+          backdropFilter: 'none',
         }}
       >
         <Brain size={11} style={{ opacity: isActive ? 0.8 : 0.4, flexShrink: 0 }} />
@@ -3669,15 +3987,14 @@ function ThinkingBlockView({ thinking }: { thinking: ThinkingBlock }): JSX.Eleme
       {/* Expanded thinking content */}
       {expanded && hasContent && (
         <div style={{
-          padding: '8px 12px 10px 12px',
+          padding: '8px 0 2px 0',
           fontSize: 12, lineHeight: 1.6, color: theme.accent.hover,
           whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           fontFamily: fonts.sans, maxHeight: 200, overflowY: 'auto',
-          background: theme.surface.selection,
-          border: `1px solid ${theme.surface.selectionBorder}`,
-          borderTop: 'none',
-          borderRadius: '0 0 8px 8px',
-          backdropFilter: 'blur(8px)',
+          background: 'transparent',
+          border: 'none',
+          borderRadius: 0,
+          backdropFilter: 'none',
           opacity: 0.85,
         }}>
           {thinking.content}
@@ -3725,7 +4042,7 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
       data-tool-block-kind={isFileChangeBlock ? 'file-changes' : 'tool'}
       style={{
         background: theme.chat.assistantBubble, border: `1px solid ${theme.chat.assistantBubbleBorder}`,
-        borderRadius: 10,
+        borderRadius: 8,
         overflow: 'hidden',
         maxWidth: expanded || isFileChangeBlock ? '100%' : `min(100%, ${TOOL_BLOCK_MAX_WIDTH}px)`,
         width: expanded || isFileChangeBlock ? '100%' : 'fit-content',
@@ -3737,12 +4054,12 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 6,
+          gap: 5,
           width: '100%',
           maxWidth: expanded || isFileChangeBlock ? '100%' : `min(100%, ${TOOL_BLOCK_MAX_WIDTH}px)`,
-          padding: isFileChangeBlock ? '12px 16px' : '5px 10px', background: 'none', border: 'none',
+          padding: isFileChangeBlock ? '12px 16px' : '5px 6px', background: 'none', border: 'none',
           cursor: 'pointer', color: isRunning ? theme.chat.textSecondary : theme.chat.muted,
-          fontSize: 12, fontFamily: fonts.sans, lineHeight: 1, minWidth: 0,
+          fontSize: 10, fontFamily: fonts.sans, lineHeight: 1, minWidth: 0,
         }}
       >
         <Wrench size={11} style={{ opacity: isRunning ? 0.7 : 0.5, flexShrink: 0 }} />
@@ -3757,7 +4074,7 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
             overflow: 'hidden',
           }}>
             <ShimmerText baseColor={theme.chat.textSecondary} style={{
-              fontSize: 13,
+              fontSize: 10.5,
               fontFamily: fonts.sans,
               fontWeight: 500,
               flex: '1 1 auto',
@@ -3788,16 +4105,16 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
                 <span style={{
                   display: 'block',
                   fontWeight: 600,
-                  fontSize: 13,
+                  fontSize: 10.5,
                   color: theme.chat.text,
                   flexShrink: 0,
                 }}>
                   {fileChangeSummary.fileCount} file{fileChangeSummary.fileCount === 1 ? '' : 's'} changed
                 </span>
-                <span style={{ color: theme.status.success, fontSize: 13, fontWeight: 600, flexShrink: 0 }}>
+                <span style={{ color: theme.status.success, fontSize: 10.5, fontWeight: 600, flexShrink: 0 }}>
                   +{fileChangeSummary.additions}
                 </span>
-                <span style={{ color: theme.status.danger, fontSize: 13, fontWeight: 600, flexShrink: 0 }}>
+                <span style={{ color: theme.status.danger, fontSize: 10.5, fontWeight: 600, flexShrink: 0 }}>
                   -{fileChangeSummary.deletions}
                 </span>
               </div>
@@ -3805,7 +4122,7 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
               <span style={{
                 display: 'block',
                 fontWeight: 500,
-                fontSize: 13,
+                fontSize: 10.5,
                 flex: '1 1 auto',
                 flexShrink: 1,
                 minWidth: 0,
@@ -3819,7 +4136,7 @@ function ToolBlockView({ block }: { block: ToolBlock }): JSX.Element {
           </div>
         )}
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginLeft: 'auto', flexShrink: 0 }}>
           {block.elapsed != null && (
             <span style={{
               fontSize: 10, color: theme.chat.muted, display: 'flex', alignItems: 'center', gap: 3,

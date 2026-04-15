@@ -62,7 +62,7 @@ interface ElectronAPI {
     inject(cardId: string, message: string): Promise<void>
   }
   chat?: {
-    send(req: unknown): Promise<{ ok: boolean }>
+    send(req: unknown): Promise<{ ok: boolean; jobId?: string; detached?: boolean }>
     resumeJob?(req: unknown): Promise<{ ok: boolean; resumed?: boolean; jobId?: string | null }>
     stop(cardId: string): Promise<void>
     clearSession(cardId: string): Promise<{ ok: boolean }>
@@ -307,16 +307,23 @@ interface ElectronAPI {
       jobs: {
         total: number
         active: number
+        backgroundActive: number
         completed: number
         failed: number
         cancelled: number
         other: number
         recent: Array<{
           id: string
+          taskLabel: string | null
           status: string
+          runMode: string | null
+          workspaceId: string | null
+          cardId: string | null
           provider: string | null
           model: string | null
           workspaceDir: string | null
+          sessionId: string | null
+          initialPrompt: string | null
           updatedAt: string | null
           requestedAt: string | null
           lastSequence: number

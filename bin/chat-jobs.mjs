@@ -39,6 +39,20 @@ function sanitizeToolOutputText(text) {
     .trim()
 }
 
+function sanitizeCodexStderrText(text) {
+  const cleaned = sanitizeToolOutputText(text)
+  if (!cleaned) return ''
+
+  return cleaned
+    .split('\n')
+    .filter(line => {
+      const trimmed = line.trim()
+      return trimmed.length > 0 && trimmed !== 'Reading additional input from stdin...'
+    })
+    .join('\n')
+    .trim()
+}
+
 function normalizeCodexShellCommand(command) {
   const trimmed = String(command ?? '').trim()
   const quotedMatch = trimmed.match(/^\/bin\/zsh -lc '([\s\S]*)'$/)
@@ -98,6 +112,43 @@ function mergeFileChanges(fileChanges) {
     existing.diff = `${existing.diff}\n\n${change.diff}`.trim()
   }
   return Array.from(merged.values())
+}
+
+function normalizeTaskLabel(value, maxLength = 88) {
+  const normalized = String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!normalized) return null
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, maxLength - 1).trimEnd()}…`
+    : normalized
+}
+
+function extractTaskLabelFromContent(content) {
+  if (typeof content === 'string') return normalizeTaskLabel(content)
+  if (Array.isArray(content)) {
+    for (const entry of content) {
+      const nested = extractTaskLabelFromContent(entry)
+      if (nested) return nested
+    }
+    return null
+  }
+  if (content && typeof content === 'object') {
+    if (typeof content.text === 'string') return normalizeTaskLabel(content.text)
+    if (typeof content.content === 'string') return normalizeTaskLabel(content.content)
+    if (Array.isArray(content.content)) return extractTaskLabelFromContent(content.content)
+  }
+  return null
+}
+
+function extractTaskLabelFromRequest(request) {
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  for (const message of messages) {
+    if (String(message?.role ?? '').trim() !== 'user') continue
+    const label = extractTaskLabelFromContent(message?.content)
+    if (label) return label
+  }
+  return `${String(request?.provider ?? 'agent').trim() || 'Agent'} task`
 }
 
 async function readSnapshotContent(filePath) {
@@ -280,6 +331,43 @@ function buildClaudeSystemPrompt(peers) {
   ].join('\n')
 }
 
+function buildAsyncExecutionPrompt(asyncExecution) {
+  if (!asyncExecution || typeof asyncExecution !== 'object') return undefined
+
+  const lines = [
+    '## Async Execution',
+    `- Active execution backend: ${String(asyncExecution.backend ?? 'unknown')} (${String(asyncExecution.hostLabel ?? 'unknown host')}).`,
+  ]
+
+  if (asyncExecution.providerNativeBackground) {
+    lines.push('- Provider-native background agents may be available. Prefer them for subagents or delegated work when that keeps the main conversation responsive.')
+  }
+
+  if (asyncExecution.detachedDaemonAvailable) {
+    lines.push('- CodeSurf also supports daemon-backed detached jobs that can continue outside the foreground chat.')
+  }
+
+  if (asyncExecution.requestedRunMode === 'background') {
+    lines.push('- This turn is running as a detached background orchestration job. Continue autonomously and do not wait for interactive clarification from the foreground chat unless blocked.')
+  } else if (asyncExecution.detachedDaemonAvailable) {
+    lines.push('- If the user wants the main conversation to stay free while work continues, prefer detached daemon orchestration for the main task thread.')
+  }
+
+  return lines.join('\n')
+}
+
+function buildClaudeAgentPrompt(peers, asyncExecution) {
+  const peerPrompt = buildClaudeSystemPrompt(peers)
+  const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
+  if (peerPrompt && asyncPrompt) return `${peerPrompt}\n\n${asyncPrompt}`
+  return peerPrompt ?? asyncPrompt
+}
+
+function buildCodexPrompt(userText, asyncExecution) {
+  const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
+  return asyncPrompt ? `${asyncPrompt}\n\n## User Request\n${userText}` : userText
+}
+
 function writeSseEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
 }
@@ -322,10 +410,9 @@ export function createChatJobManager({ homeDir }) {
     metadata.updatedAt = new Date().toISOString()
     if (event.sessionId) metadata.sessionId = event.sessionId
     if (event.type === 'error') {
-      metadata.status = 'failed'
       metadata.error = event.error ?? 'Unknown error'
     } else if (event.type === 'done') {
-      metadata.status = metadata.status === 'failed' ? 'failed' : 'completed'
+      metadata.status = metadata.error ? 'failed' : 'completed'
       metadata.completedAt = new Date().toISOString()
     }
 
@@ -400,7 +487,7 @@ export function createChatJobManager({ homeDir }) {
       ...(request.sessionId ? { resume: request.sessionId } : {}),
     }
 
-    const systemPrompt = buildClaudeSystemPrompt(request.peers)
+    const systemPrompt = buildClaudeAgentPrompt(request.peers, request.asyncExecution)
     if (systemPrompt) {
       options.agent = 'contex'
       options.agents = {
@@ -510,7 +597,7 @@ export function createChatJobManager({ homeDir }) {
       '--dangerously-bypass-approvals-and-sandbox',
       '--skip-git-repo-check',
       ...(workspaceDir ? ['-C', workspaceDir] : []),
-      lastUserMsg.content,
+      buildCodexPrompt(lastUserMsg.content, request.asyncExecution),
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
@@ -527,6 +614,8 @@ export function createChatJobManager({ homeDir }) {
     let pendingStdout = ''
     let stdoutChain = Promise.resolve()
     let stderrBuf = ''
+    let exitCode = null
+    let procError = null
 
     const handleCodexJsonEvent = async (evt) => {
       if (!evt || typeof evt !== 'object') return
@@ -633,8 +722,14 @@ export function createChatJobManager({ homeDir }) {
     })
 
     await new Promise((resolveJob) => {
-      proc.on('close', () => resolveJob())
-      proc.on('error', () => resolveJob())
+      proc.on('close', (code) => {
+        exitCode = code
+        resolveJob()
+      })
+      proc.on('error', (error) => {
+        procError = error
+        resolveJob()
+      })
     })
 
     await stdoutChain.catch(() => {})
@@ -645,8 +740,13 @@ export function createChatJobManager({ homeDir }) {
         await appendEvent(job.id, { type: 'text', text: pendingStdout })
       }
     }
-    if (stderrBuf.trim()) {
-      await appendEvent(job.id, { type: 'error', error: stderrBuf.trim() })
+    const stderrText = sanitizeCodexStderrText(stderrBuf)
+    if (procError instanceof Error) {
+      await appendEvent(job.id, { type: 'error', error: procError.message })
+    } else if (stderrText) {
+      await appendEvent(job.id, { type: 'error', error: stderrText })
+    } else if (typeof exitCode === 'number' && exitCode !== 0) {
+      await appendEvent(job.id, { type: 'error', error: `Codex exited with code ${exitCode}` })
     }
     await appendEvent(job.id, { type: 'done' })
   }
@@ -669,12 +769,18 @@ export function createChatJobManager({ homeDir }) {
   async function startJob(request) {
     const id = randomUUID()
     const workspaceDir = await ensureProvisionedWorkspace(homeDir, request.projectContext ?? { workspaceDir: request.workspaceDir })
+    const initialPrompt = extractTaskLabelFromRequest(request)
     const metadata = {
       id,
+      taskLabel: initialPrompt,
       status: 'running',
       provider: request.provider,
       model: request.model,
+      runMode: request.runMode === 'background' ? 'background' : 'foreground',
+      workspaceId: typeof request.workspaceId === 'string' ? request.workspaceId : null,
+      cardId: typeof request.cardId === 'string' ? request.cardId : null,
       workspaceDir,
+      initialPrompt,
       requestedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       completedAt: null,
@@ -748,5 +854,8 @@ export function createChatJobManager({ homeDir }) {
     cancelJob,
     getJobState,
     streamJob,
+    listLiveJobIds() {
+      return Array.from(liveJobs.keys())
+    },
   }
 }

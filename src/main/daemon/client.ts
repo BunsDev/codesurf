@@ -52,6 +52,39 @@ async function daemonRequest<T>(path: string, options?: RequestOptions): Promise
 }
 
 export const daemonClient = {
+  getJobDashboard(): Promise<{
+    jobs: Array<{
+      id: string
+      taskLabel: string | null
+      status: string
+      runMode?: string | null
+      provider: string | null
+      model: string | null
+      workspaceDir: string | null
+      requestedAt: string | null
+      updatedAt: string | null
+      completedAt?: string | null
+      lastSequence: number
+      sessionId?: string | null
+      error: string | null
+    }>
+    summary: {
+      total: number
+      active: number
+      backgroundActive: number
+      completed: number
+      failed: number
+      cancelled: number
+      other: number
+    }
+    daemon: {
+      pid: number
+      startedAt: string
+      appVersion: string | null
+    }
+  }> {
+    return daemonRequest('/dashboard/api/jobs')
+  },
   listHosts(): Promise<ExecutionHostRecord[]> {
     return daemonRequest('/host/list')
   },

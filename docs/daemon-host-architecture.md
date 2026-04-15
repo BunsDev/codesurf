@@ -19,6 +19,27 @@
   - registered remote daemon executes the task off-machine
   - cloud/offload path
 
+## Chat run modes
+
+- `foreground`
+  - current tile owns the live stream
+  - a new foreground turn replaces any existing foreground execution for that tile
+- `background`
+  - daemon-backed only
+  - job runs detached from the tile stream and continues independently
+  - intended for orchestration/offload work so the foreground chat can keep talking about something else
+
+## Async preference model
+
+When daemon execution is available, chat reasoning should understand three async paths:
+
+1. provider-native backgrounding
+   - preferred for Claude/Codex subagents if the provider offers a stronger native workflow
+2. daemon-detached orchestration
+   - preferred when the main conversation should remain free while work continues in CodeSurf infrastructure
+3. foreground streaming
+   - default interactive mode for normal conversational turns
+
 ## Routing policy
 
 Execution routing is stored in `settings.execution`:

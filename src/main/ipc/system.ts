@@ -5,6 +5,7 @@ import { join } from 'path'
 import { bus } from '../event-bus'
 import { removeTile as removePeerTile } from '../peer-state'
 import { getDaemonStatus, restartDaemon } from '../daemon/manager'
+import { daemonClient } from '../daemon/client'
 import { CONTEX_HOME } from '../paths'
 
 // Debounce GC — if cleanupTile is called many times in quick succession we don't
@@ -66,10 +67,16 @@ function sanitizeDaemonState(result: { running: boolean; info: Awaited<ReturnTyp
 
 type DaemonJobRecord = {
   id: string
+  taskLabel?: string | null
   status: string
+  runMode?: string | null
+  workspaceId?: string | null
+  cardId?: string | null
   provider?: string
   model?: string
   workspaceDir?: string | null
+  sessionId?: string | null
+  initialPrompt?: string | null
   requestedAt?: string
   updatedAt?: string
   completedAt?: string | null
@@ -80,27 +87,35 @@ type DaemonJobRecord = {
 function readDaemonJobSummary(): {
   total: number
   active: number
+  backgroundActive: number
   completed: number
   failed: number
   cancelled: number
   other: number
-  recent: Array<{
-    id: string
-    status: string
-    provider: string | null
-    model: string | null
-    workspaceDir: string | null
-    updatedAt: string | null
-    requestedAt: string | null
-    lastSequence: number
-    error: string | null
-  }>
+    recent: Array<{
+      id: string
+      taskLabel: string | null
+      status: string
+      runMode: string | null
+      workspaceId: string | null
+      cardId: string | null
+      provider: string | null
+      model: string | null
+      workspaceDir: string | null
+      sessionId: string | null
+      initialPrompt: string | null
+      updatedAt: string | null
+      requestedAt: string | null
+      lastSequence: number
+      error: string | null
+    }>
 } {
   const jobsDir = join(CONTEX_HOME, 'jobs')
   if (!existsSync(jobsDir)) {
     return {
       total: 0,
       active: 0,
+      backgroundActive: 0,
       completed: 0,
       failed: 0,
       cancelled: 0,
@@ -123,10 +138,16 @@ function readDaemonJobSummary(): {
   const normalized = records
     .map(record => ({
       id: record.id,
+      taskLabel: typeof record.taskLabel === 'string' ? record.taskLabel : null,
       status: typeof record.status === 'string' ? record.status : 'unknown',
+      runMode: typeof record.runMode === 'string' ? record.runMode : 'foreground',
+      workspaceId: typeof record.workspaceId === 'string' ? record.workspaceId : null,
+      cardId: typeof record.cardId === 'string' ? record.cardId : null,
       provider: typeof record.provider === 'string' ? record.provider : null,
       model: typeof record.model === 'string' ? record.model : null,
       workspaceDir: typeof record.workspaceDir === 'string' ? record.workspaceDir : null,
+      sessionId: typeof record.sessionId === 'string' ? record.sessionId : null,
+      initialPrompt: typeof record.initialPrompt === 'string' ? record.initialPrompt : null,
       updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : null,
       requestedAt: typeof record.requestedAt === 'string' ? record.requestedAt : null,
       lastSequence: typeof record.lastSequence === 'number' ? record.lastSequence : 0,
@@ -141,6 +162,7 @@ function readDaemonJobSummary(): {
   const counts = normalized.reduce((acc, record) => {
     if (record.status === 'running' || record.status === 'starting' || record.status === 'queued' || record.status === 'reconnecting') {
       acc.active += 1
+      if (record.runMode === 'background') acc.backgroundActive += 1
     } else if (record.status === 'completed') {
       acc.completed += 1
     } else if (record.status === 'failed' || record.status === 'lost') {
@@ -153,6 +175,7 @@ function readDaemonJobSummary(): {
     return acc
   }, {
     active: 0,
+    backgroundActive: 0,
     completed: 0,
     failed: 0,
     cancelled: 0,
@@ -162,11 +185,12 @@ function readDaemonJobSummary(): {
   return {
     total: normalized.length,
     active: counts.active,
+    backgroundActive: counts.backgroundActive,
     completed: counts.completed,
     failed: counts.failed,
     cancelled: counts.cancelled,
     other: counts.other,
-    recent: normalized.slice(0, 6),
+    recent: normalized.slice(0, 20),
   }
 }
 
@@ -207,6 +231,38 @@ export function registerSystemIPC(): void {
 
   ipcMain.handle('system:daemonSummary', async () => {
     const status = sanitizeDaemonState(await getDaemonStatus())
+    const dashboard = await daemonClient.getJobDashboard().catch(() => null)
+    if (dashboard) {
+      return {
+        ...status,
+        jobs: {
+          total: dashboard.summary.total,
+          active: dashboard.summary.active,
+          backgroundActive: dashboard.summary.backgroundActive,
+          completed: dashboard.summary.completed,
+          failed: dashboard.summary.failed,
+          cancelled: dashboard.summary.cancelled,
+          other: dashboard.summary.other,
+          recent: dashboard.jobs.slice(0, 6).map(job => ({
+            id: job.id,
+            taskLabel: job.taskLabel,
+            status: job.status,
+            runMode: job.runMode ?? null,
+            workspaceId: job.workspaceId ?? null,
+            cardId: job.cardId ?? null,
+            provider: job.provider,
+            model: job.model,
+            workspaceDir: job.workspaceDir,
+            sessionId: job.sessionId ?? null,
+            initialPrompt: job.initialPrompt ?? null,
+            updatedAt: job.updatedAt,
+            requestedAt: job.requestedAt,
+            lastSequence: job.lastSequence,
+            error: job.error,
+          })).slice(0, 20),
+        },
+      }
+    }
     return {
       ...status,
       jobs: readDaemonJobSummary(),

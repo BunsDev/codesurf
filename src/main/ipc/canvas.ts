@@ -108,6 +108,17 @@ function sessionTitleFromText(text: string | null | undefined, provider: string)
   return trimmed.split(/\r?\n/, 1)[0].slice(0, 80)
 }
 
+function extractSessionTitle(messages: Record<string, unknown>[], provider: string): string | null {
+  for (const rawMessage of messages) {
+    if (!rawMessage || typeof rawMessage !== 'object') continue
+    const role = typeof rawMessage.role === 'string' ? rawMessage.role : ''
+    const text = truncateSessionText(typeof rawMessage.content === 'string' ? rawMessage.content : null)
+    if (!text) continue
+    if (role === 'user') return sessionTitleFromText(text, provider)
+  }
+  return null
+}
+
 function extractTileSessionSummary(tileId: string, state: unknown): TileSessionSummary | null {
   if (!state || typeof state !== 'object') return null
   const record = state as Record<string, unknown>
@@ -139,7 +150,7 @@ function extractTileSessionSummary(tileId: string, state: unknown): TileSessionS
     model,
     messageCount: messages.length,
     lastMessage,
-    title: sessionTitleFromText(lastMessage, provider),
+    title: extractSessionTitle(messages as Record<string, unknown>[], provider) ?? sessionTitleFromText(lastMessage, provider),
     updatedAt: Date.now(),
   }
 }
@@ -330,7 +341,7 @@ export function registerCanvasIPC(): void {
   ipcMain.handle('canvas:getSessionState', async (_, workspaceId: string, sessionEntryId: string) => {
     const workspacePath = await getWorkspacePathById(workspaceId)
 
-    if (sessionEntryId.startsWith('codesurf-tile:')) {
+    if (sessionEntryId.startsWith('codesurf-tile:') || sessionEntryId.startsWith('codesurf-job:')) {
       return await daemonClient.getLocalSessionState(workspaceId, sessionEntryId).catch(() => null)
     }
 
@@ -341,7 +352,7 @@ export function registerCanvasIPC(): void {
     assertSafeId(workspaceId)
     const workspacePath = await getWorkspacePathById(workspaceId)
 
-    if (sessionEntryId.startsWith('codesurf-tile:')) {
+    if (sessionEntryId.startsWith('codesurf-tile:') || sessionEntryId.startsWith('codesurf-job:')) {
       const result = await daemonClient.deleteLocalSession(workspaceId, sessionEntryId).catch(error => ({
         ok: false,
         error: error instanceof Error ? error.message : String(error),

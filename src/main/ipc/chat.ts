@@ -22,7 +22,7 @@ import { parseClaudeStream } from '../agent-stream'
 import { ensureLocalProxyRunning } from './localProxy'
 import type { ExecutionHostRecord, ExecutionPreference, ExtensionChatTransportConfig } from '../../shared/types'
 import { daemonClient } from '../daemon/client'
-import { ensureDaemonRunning, getDaemonStatus } from '../daemon/manager'
+import { ensureDaemonRunning } from '../daemon/manager'
 import { getBuiltinExecutionHosts, resolveExecutionTarget } from '../execution/targets'
 import { readSettingsSync } from './workspace'
 // Lazy-loaded: @opencode-ai/sdk only exports ESM, Electron main is CJS.
@@ -65,6 +65,7 @@ interface PeerContext {
 
 interface ChatRequest {
   cardId: string
+  workspaceId?: string
   provider: string
   model: string
   messages: ChatMessage[]
@@ -80,6 +81,16 @@ interface ChatRequest {
   executionPreference?: ExecutionPreference | null
   jobId?: string | null
   jobSequence?: number
+  runMode?: 'foreground' | 'background'
+  asyncExecution?: {
+    requestedRunMode: 'foreground' | 'background'
+    backend: 'runtime' | 'daemon'
+    hostType: 'runtime' | 'local-daemon' | 'remote-daemon'
+    hostLabel: string
+    providerNativeBackground: boolean
+    detachedDaemonAvailable: boolean
+    detachedDaemonPreferred: boolean
+  }
 }
 
 function log(...args: unknown[]): void {
@@ -216,12 +227,22 @@ async function hostRequest<T>(host: ExecutionHostRecord, path: string, options?:
   return payload as T
 }
 
-async function listExecutionHosts(): Promise<ExecutionHostRecord[]> {
+async function getExecutionRoutingState(): Promise<{
+  hosts: ExecutionHostRecord[]
+  localDaemonAvailable: boolean
+}> {
   try {
     await ensureDaemonRunning()
-    return await daemonClient.listHosts()
+    const hosts = await daemonClient.listHosts()
+    return {
+      hosts,
+      localDaemonAvailable: true,
+    }
   } catch {
-    return getBuiltinExecutionHosts()
+    return {
+      hosts: getBuiltinExecutionHosts(),
+      localDaemonAvailable: false,
+    }
   }
 }
 
@@ -229,8 +250,71 @@ function supportsDaemonChatProvider(provider: string | null | undefined): boolea
   return provider === 'claude' || provider === 'codex'
 }
 
+function supportsProviderNativeBackground(provider: string | null | undefined): boolean {
+  return provider === 'claude' || provider === 'codex'
+}
+
+function buildAsyncExecutionContext(params: {
+  request: ChatRequest
+  daemonHost: ExecutionHostRecord | null
+  localDaemonAvailable: boolean
+}): NonNullable<ChatRequest['asyncExecution']> {
+  const requestedRunMode = params.request.runMode === 'background' ? 'background' : 'foreground'
+  const backend = params.daemonHost ? 'daemon' : 'runtime'
+  const hostType = params.daemonHost?.type ?? 'runtime'
+  const hostLabel = params.daemonHost?.label ?? 'Electron runtime'
+  const providerNativeBackground = supportsProviderNativeBackground(params.request.provider)
+  const detachedDaemonAvailable = Boolean(params.daemonHost) || params.localDaemonAvailable
+
+  return {
+    requestedRunMode,
+    backend,
+    hostType,
+    hostLabel,
+    providerNativeBackground,
+    detachedDaemonAvailable,
+    detachedDaemonPreferred: detachedDaemonAvailable && !providerNativeBackground,
+  }
+}
+
+function buildAsyncExecutionPrompt(asyncExecution: ChatRequest['asyncExecution']): string | undefined {
+  if (!asyncExecution) return undefined
+
+  const lines = [
+    '## Async Execution',
+    `- Active execution backend: ${asyncExecution.backend} (${asyncExecution.hostLabel}).`,
+  ]
+
+  if (asyncExecution.providerNativeBackground) {
+    lines.push('- Provider-native background agents may be available. Prefer that path for subagents or long-running delegated work when it keeps the main chat responsive.')
+  }
+
+  if (asyncExecution.detachedDaemonAvailable) {
+    lines.push('- CodeSurf also supports daemon-backed detached jobs that can continue outside the foreground chat.')
+  }
+
+  if (asyncExecution.requestedRunMode === 'background') {
+    lines.push('- This turn is running as a detached background orchestration job. Continue autonomously and do not expect interactive clarification from the foreground chat unless the task is blocked.')
+  } else if (asyncExecution.detachedDaemonAvailable) {
+    lines.push('- If the user wants the main conversation to stay free while work continues, prefer detached daemon orchestration for the main task thread.')
+  }
+
+  return lines.join('\n')
+}
+
+function buildClaudeAgentPrompt(basePrompt: string | undefined, asyncExecution: ChatRequest['asyncExecution']): string | undefined {
+  const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
+  if (basePrompt && asyncPrompt) return `${basePrompt}\n\n${asyncPrompt}`
+  return basePrompt ?? asyncPrompt
+}
+
+function buildCodexPrompt(userText: string, asyncExecution: ChatRequest['asyncExecution']): string {
+  const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
+  return asyncPrompt ? `${asyncPrompt}\n\n## User Request\n${userText}` : userText
+}
+
 async function selectChatExecutionHost(req: ChatRequest): Promise<ExecutionHostRecord | null> {
-  const hosts = await listExecutionHosts()
+  const { hosts, localDaemonAvailable } = await getExecutionRoutingState()
   const settings = readSettingsSync()
   const executionPreference = req.executionPreference ?? settings.execution
   const provider = String(req.provider ?? '').trim()
@@ -257,11 +341,10 @@ async function selectChatExecutionHost(req: ChatRequest): Promise<ExecutionHostR
     return chosen
   }
 
-  const daemonStatus = await getDaemonStatus()
   const resolution = resolveExecutionTarget({
     hosts,
     preference: executionPreference,
-    localDaemonAvailable: daemonStatus.running === true,
+    localDaemonAvailable,
   })
   return resolution.host.type === 'runtime' ? null : resolution.host
 }
@@ -369,7 +452,7 @@ async function attachDaemonJobStream(cardId: string, host: ExecutionHostRecord, 
   }
 }
 
-async function sendChatToDaemon(req: ChatRequest, host: ExecutionHostRecord): Promise<{ ok: boolean; jobId: string }> {
+async function sendChatToDaemon(req: ChatRequest, host: ExecutionHostRecord): Promise<{ ok: boolean; jobId: string; detached?: boolean }> {
   const projectContext = await buildProjectContext(req.workspaceDir)
   const job = await hostRequest<{
     id: string
@@ -383,12 +466,14 @@ async function sendChatToDaemon(req: ChatRequest, host: ExecutionHostRecord): Pr
     },
   })
 
-  void attachDaemonJobStream(req.cardId, host, job.id, 0).catch((error: Error) => {
-    sendStream(req.cardId, { type: 'error', error: error.message, jobId: job.id })
-    sendStream(req.cardId, { type: 'done', jobId: job.id })
-  })
+  if (req.runMode !== 'background') {
+    void attachDaemonJobStream(req.cardId, host, job.id, 0).catch((error: Error) => {
+      sendStream(req.cardId, { type: 'error', error: error.message, jobId: job.id })
+      sendStream(req.cardId, { type: 'done', jobId: job.id })
+    })
+  }
 
-  return { ok: true, jobId: job.id }
+  return { ok: true, jobId: job.id, detached: req.runMode === 'background' }
 }
 
 async function resumeChatDaemonJob(req: ChatRequest): Promise<{ ok: boolean; resumed: boolean; jobId: string | null }> {
@@ -896,6 +981,7 @@ function chatClaude(req: ChatRequest): void {
     ].join('\n')
     log('systemPrompt built for', req.peers.length, 'peers, contex tools:', contexToolNames.length)
   }
+  systemPrompt = buildClaudeAgentPrompt(systemPrompt, req.asyncExecution)
 
   // Resolve claude binary from startup detection
   const claudePath = getAgentPath('claude')
@@ -1227,7 +1313,7 @@ function chatCodex(req: ChatRequest): void {
   } else {
     args.push('--skip-git-repo-check')
   }
-  args.push(lastUserMsg.content)
+  args.push(buildCodexPrompt(lastUserMsg.content, req.asyncExecution))
 
   const proc = spawn(codexBin, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -2030,27 +2116,32 @@ export function registerChatIPC(): void {
   log('registerChatIPC: handlers registered')
   ipcMain.handle('chat:send', async (_, req: ChatRequest) => {
     log('chat:send received', { provider: req.provider, model: req.model, msgCount: req.messages.length })
-    // Kill existing query/process for this card
-    const existingQuery = activeQueries.get(req.cardId)
-    if (existingQuery) {
-      existingQuery.close()
-      activeQueries.delete(req.cardId)
-    }
-    const existingProc = activeProcesses.get(req.cardId)
-    if (existingProc) {
-      existingProc.kill('SIGTERM')
-      activeProcesses.delete(req.cardId)
-    }
-    const existingHttpRequest = activeHttpRequests.get(req.cardId)
-    if (existingHttpRequest) {
-      existingHttpRequest.destroy()
-      activeHttpRequests.delete(req.cardId)
-    }
+    const requestedRunMode = req.runMode === 'background' ? 'background' : 'foreground'
+    if (requestedRunMode === 'foreground') {
+      // Foreground turns replace the current foreground execution for this card.
+      const existingQuery = activeQueries.get(req.cardId)
+      if (existingQuery) {
+        existingQuery.close()
+        activeQueries.delete(req.cardId)
+      }
+      const existingProc = activeProcesses.get(req.cardId)
+      if (existingProc) {
+        existingProc.kill('SIGTERM')
+        activeProcesses.delete(req.cardId)
+      }
+      const existingHttpRequest = activeHttpRequests.get(req.cardId)
+      if (existingHttpRequest) {
+        existingHttpRequest.destroy()
+        activeHttpRequests.delete(req.cardId)
+      }
 
-    await cancelChatDaemonJob(req.cardId)
+      await cancelChatDaemonJob(req.cardId)
+    }
 
     let daemonHost: ExecutionHostRecord | null = null
+    let localDaemonAvailable = false
     try {
+      localDaemonAvailable = (await getExecutionRoutingState()).localDaemonAvailable
       daemonHost = await selectChatExecutionHost(req)
     } catch (error) {
       sendStream(req.cardId, {
@@ -2061,22 +2152,62 @@ export function registerChatIPC(): void {
       return { ok: false }
     }
 
-    if (daemonHost) {
-      return await sendChatToDaemon(req, daemonHost)
+    const effectiveRequest: ChatRequest = {
+      ...req,
+      runMode: requestedRunMode,
+      asyncExecution: buildAsyncExecutionContext({
+        request: { ...req, runMode: requestedRunMode },
+        daemonHost,
+        localDaemonAvailable,
+      }),
     }
 
-    switch (req.provider) {
-      case 'claude': chatClaude(req); break
-      case 'codex': chatCodex(req); break
-      case 'opencode': chatOpencode(req); break
-      case 'openclaw': chatOpenclaw(req); break
-      case 'hermes': chatHermes(req); break
+    if (daemonHost) {
+      log('chat execution route', {
+        cardId: req.cardId,
+        provider: req.provider,
+        model: req.model,
+        runMode: requestedRunMode,
+        executionTarget: req.executionTarget ?? 'local',
+        executionPreference: req.executionPreference ?? null,
+        backend: 'daemon',
+        hostId: daemonHost.id,
+        hostType: daemonHost.type,
+      })
+      return await sendChatToDaemon(effectiveRequest, daemonHost)
+    }
+
+    if (requestedRunMode === 'background') {
+      sendStream(req.cardId, {
+        type: 'error',
+        error: 'Detached background chat execution currently requires a daemon-backed Claude or Codex host.',
+      })
+      sendStream(req.cardId, { type: 'done' })
+      return { ok: false }
+    }
+
+    log('chat execution route', {
+      cardId: req.cardId,
+      provider: req.provider,
+      model: req.model,
+      runMode: requestedRunMode,
+      executionTarget: req.executionTarget ?? 'local',
+      executionPreference: req.executionPreference ?? null,
+      backend: 'runtime',
+    })
+
+    switch (effectiveRequest.provider) {
+      case 'claude': chatClaude(effectiveRequest); break
+      case 'codex': chatCodex(effectiveRequest); break
+      case 'opencode': chatOpencode(effectiveRequest); break
+      case 'openclaw': chatOpenclaw(effectiveRequest); break
+      case 'hermes': chatHermes(effectiveRequest); break
       default:
-        if (req.providerTransport?.type === 'local-proxy') {
-          chatLocalProxy(req)
+        if (effectiveRequest.providerTransport?.type === 'local-proxy') {
+          chatLocalProxy(effectiveRequest)
         } else {
-          sendStream(req.cardId, { type: 'error', error: `Unsupported provider: ${req.provider}` })
-          sendStream(req.cardId, { type: 'done' })
+          sendStream(effectiveRequest.cardId, { type: 'error', error: `Unsupported provider: ${effectiveRequest.provider}` })
+          sendStream(effectiveRequest.cardId, { type: 'done' })
         }
     }
 

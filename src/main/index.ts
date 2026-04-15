@@ -46,6 +46,19 @@ app.commandLine.appendSwitch('js-flags', `--expose-gc --max-old-space-size=${max
 const windowTitles = new Map<number, string>()
 const freshWindowIds = new Set<number>()
 let extensionRegistry: ExtensionRegistry | null = null
+
+function resolveBundledExtensionDirs(): string[] {
+  const envDir = process.env.CODESURF_BUNDLED_EXTENSIONS_DIR
+  const candidates = [
+    envDir ?? '',
+    join(app.getAppPath(), 'bundled-extensions'),
+    join(app.getAppPath(), 'resources', 'bundled-extensions'),
+    join(process.resourcesPath, 'bundled-extensions'),
+  ]
+
+  return [...new Set(candidates.filter(candidate => existsSync(candidate)))]
+}
+
 function resolveAppIconPath(): string | null {
   const candidates = [
     join(process.resourcesPath, 'icon.png'),
@@ -196,7 +209,7 @@ app.whenReady().then(async () => {
 
   // Keep the extension system fully lazy. Do not scan or boot extension hosts
   // at startup; load them only when an extension tile or explicit management UI asks.
-  extensionRegistry = new ExtensionRegistry()
+  extensionRegistry = new ExtensionRegistry({ bundledDirs: resolveBundledExtensionDirs() })
   registerExtensionProtocol(extensionRegistry)
   registerExtensionIPC(extensionRegistry)
   setExtensionRegistryProvider(() => extensionRegistry)

@@ -608,7 +608,7 @@ export function ExtensionTile({ tileId, extType, width, height, workspaceId, wor
       <iframe
         ref={iframeRef}
         src={entryUrl}
-        sandbox="allow-scripts allow-same-origin"
+        sandbox="allow-scripts allow-same-origin allow-modals"
         style={{
           position: 'absolute',
           top: 0,

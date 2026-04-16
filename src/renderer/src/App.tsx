@@ -3668,6 +3668,44 @@ function App(): JSX.Element {
     discoveryTimeoutsRef.current = []
   }, [])
 
+  useEffect(() => {
+    const root = document.documentElement
+    root.style.setProperty('--color-background', theme.chat.background)
+    root.style.setProperty('--color-foreground', theme.text.primary)
+    root.style.setProperty('--color-muted', theme.surface.panelMuted)
+    root.style.setProperty('--color-muted-foreground', theme.text.muted)
+    root.style.setProperty('--color-border', theme.border.default)
+    root.style.setProperty('--color-input', theme.chat.inputBorder)
+    root.style.setProperty('--color-ring', theme.accent.base)
+    root.style.setProperty('--color-primary', theme.accent.base)
+    root.style.setProperty('--color-primary-foreground', theme.text.inverse)
+    root.style.setProperty('--color-secondary', theme.surface.panelElevated)
+    root.style.setProperty('--color-secondary-foreground', theme.text.secondary)
+    root.style.setProperty('--color-accent', theme.surface.hover)
+    root.style.setProperty('--color-accent-foreground', theme.text.primary)
+    root.style.setProperty('--color-destructive', theme.status.danger)
+    root.style.setProperty('--color-destructive-foreground', theme.text.inverse)
+    root.style.setProperty('--color-card', theme.surface.panel)
+    root.style.setProperty('--color-card-foreground', theme.text.primary)
+    root.style.setProperty('--color-popover', theme.surface.panel)
+    root.style.setProperty('--color-popover-foreground', theme.text.primary)
+    root.style.setProperty('--color-sidebar', theme.surface.panelMuted)
+  }, [
+    theme.accent.base,
+    theme.border.default,
+    theme.chat.background,
+    theme.chat.inputBorder,
+    theme.status.danger,
+    theme.surface.hover,
+    theme.surface.panel,
+    theme.surface.panelElevated,
+    theme.surface.panelMuted,
+    theme.text.inverse,
+    theme.text.muted,
+    theme.text.primary,
+    theme.text.secondary,
+  ])
+
   return (
     <ThemeProvider value={theme}>
     <FontTokenProvider value={fontTokens}>

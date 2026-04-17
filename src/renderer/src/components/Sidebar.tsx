@@ -857,7 +857,8 @@ const visibleSessions = useMemo(() => {
                       label={session.title.length > 44 ? `${session.title.slice(0, 44)}...` : session.title}
                       icon={SESSION_SOURCE_ICONS[session.source]}
                       indent={Math.max(1, session.displayIndent + 1)}
-                      extraWidth={132}
+                      extraWidth={24}
+                      title={`${session.title}\n${session.sourceLabel}${session.messageCount > 0 ? ` · ${session.messageCount} msg` : ''}`}
                       onClick={() => {
                         if (session.tileId && openTileIdSet.has(session.tileId)) {
                           onFocusTile(session.tileId)
@@ -871,14 +872,6 @@ const visibleSessions = useMemo(() => {
                       }}
                       extra={
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                          <span style={{
-                            fontSize: fonts.secondarySize - 1,
-                            color: theme.text.disabled,
-                            whiteSpace: 'nowrap',
-                            flexShrink: 0,
-                          }}>
-                            {session.sourceLabel}{session.messageCount > 0 ? ` · ${session.messageCount} msg` : ''}
-                          </span>
                           <button
                             title={pendingDeleteSessionId === session.id ? 'Click again to confirm delete' : 'Delete session'}
                             onClick={e => {

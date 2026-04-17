@@ -366,6 +366,13 @@ export interface AppSettings {
   settingsPanelExtIds: string[]
   // Master kill-switch: hide all extensions from sidebar and footer
   extensionsDisabled: boolean
+  // Status bar health readout: 'compact' (default) shows a dot + HEALTH label
+  // with hover detail; 'verbose' shows the full heap bar and numbers inline.
+  statusBarHealth: 'compact' | 'verbose'
+  // When true, the sidebar footer shows a prominent "Get Extensions" button
+  // that opens the gallery modal, and legacy extension entry points (sidebar
+  // flyout, Settings > Extensions nav) are hidden. Flip to false to restore.
+  extensionsGalleryEnabled: boolean
 }
 
 export type ToolPermissionDecisionScope = 'once' | 'session' | 'today' | 'forever'
@@ -434,6 +441,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   hiddenFromSidebarExtIds: [],
   settingsPanelExtIds: [],
   extensionsDisabled: false,
+  statusBarHealth: 'compact',
+  extensionsGalleryEnabled: true,
 }
 
 /** Deep-merge a single font token with its default */

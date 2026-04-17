@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Pin, Settings } from 'lucide-react'
+import { Pin, Settings, Package, Puzzle } from 'lucide-react'
 import { useAppFonts } from '../../FontContext'
 import { useTheme } from '../../ThemeContext'
 import { TILE_ICONS } from './utils'
@@ -16,6 +16,9 @@ export interface SidebarFooterProps {
   extensionTiles?: ExtTileEntry[]
   onAddExtensionTile?: (type: string) => void
   collapsed?: boolean
+  /** When true, replaces the legacy extension flyout with a prominent "Get Extensions" button. */
+  galleryEnabled?: boolean
+  onOpenGallery?: () => void
 }
 
 export function SidebarFooter({
@@ -23,6 +26,8 @@ export function SidebarFooter({
   onOpenSettings,
   extensionTiles, onAddExtensionTile,
   collapsed,
+  galleryEnabled,
+  onOpenGallery,
 }: SidebarFooterProps): React.JSX.Element {
   const theme = useTheme()
   const fonts = useAppFonts()
@@ -44,8 +49,51 @@ export function SidebarFooter({
   }, [extensionTiles])
 
   return (
-    <div style={{ padding: collapsed ? '4px 2px 2px' : '11px 8px 2px', display: 'flex', alignItems: 'center', justifyContent: collapsed ? 'center' : 'flex-end', gap: 2, flexDirection: collapsed ? 'column' : 'row' }}>
-      <div style={{ display: 'flex', justifyContent: collapsed ? 'center' : 'flex-end', gap: 2, flexShrink: 0, flexDirection: collapsed ? 'column' : 'row' }}>
+    <div style={{ padding: '11px 8px 2px', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: collapsed ? 6 : 10, flexDirection: 'row', width: 'fit-content' }}>
+      {galleryEnabled && onOpenGallery && !collapsed && (
+        <button
+          onClick={onOpenGallery}
+          title="Browse and install extensions"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '5px 10px',
+            borderRadius: 6,
+            border: `1px solid ${theme.accent.base}`,
+            background: theme.accent.base,
+            color: theme.text.inverse,
+            fontSize: fonts.size,
+            fontWeight: 600,
+            fontFamily: fonts.primary,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+          }}
+          onMouseEnter={e => { e.currentTarget.style.filter = 'brightness(1.08)' }}
+          onMouseLeave={e => { e.currentTarget.style.filter = 'none' }}
+        >
+          <Package size={13} />
+          <span>Get Extensions</span>
+        </button>
+      )}
+      {galleryEnabled && onOpenGallery && collapsed && (
+        <button
+          onClick={onOpenGallery}
+          title="Get Extensions"
+          style={{
+            width: 28, height: 28, borderRadius: 6,
+            border: `1px solid ${theme.accent.base}`,
+            background: theme.accent.base,
+            color: theme.text.inverse,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: 'pointer',
+          }}
+        >
+          <Package size={14} />
+        </button>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-start', gap: 2, flexShrink: 0, flexDirection: 'row' }}>
         {([
           { label: 'Settings', icon: <Settings size={14} />, action: () => onOpenSettings('general') },
           { label: 'New Terminal', icon: TILE_ICONS.terminal, action: onNewTerminal },
@@ -67,7 +115,31 @@ export function SidebarFooter({
           </button>
         ))}
 
-        {extensionTiles && extensionTiles.length > 0 && (
+        {/* Installed extensions render inline in the toolbar (surface: toolbar.bottomLeft). */}
+        {galleryEnabled && extensionTiles && extensionTiles.length > 0 && extensionTiles.map(ext => {
+          const disabled = ext.type === 'ext:artifact-builder'
+          return (
+            <button
+              key={ext.type}
+              title={disabled ? `${ext.label} disabled` : ext.label}
+              onClick={disabled ? undefined : () => onAddExtensionTile?.(ext.type)}
+              style={{
+                width: 28, height: 28, borderRadius: 6, border: 'none', background: 'transparent',
+                color: disabled ? theme.text.disabled : footerIconColor,
+                cursor: disabled ? 'not-allowed' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                opacity: disabled ? 0.45 : 1,
+                fontSize: 14, lineHeight: 1,
+              }}
+              onMouseEnter={e => { if (!disabled) e.currentTarget.style.color = theme.text.primary }}
+              onMouseLeave={e => { e.currentTarget.style.color = disabled ? theme.text.disabled : footerIconColor }}
+            >
+              {ext.icon ? <span style={{ fontSize: 14, lineHeight: 1 }}>{ext.icon}</span> : <Puzzle size={14} />}
+            </button>
+          )
+        })}
+
+        {!galleryEnabled && extensionTiles && extensionTiles.length > 0 && (
           <div style={{ position: 'relative' }} ref={extMenuRef}>
             <button title="Extensions" style={{
               width: 28, height: 28, borderRadius: 6, border: 'none', background: 'transparent',

@@ -102,7 +102,7 @@ export function SidebarMenuPortal({ anchorRef, children }: { anchorRef: React.Re
   )
 }
 
-export function SidebarItem({ label, icon, active, muted, onClick, onContextMenu, indent = 0, extra, extraAlwaysVisible = false, extraWidth }: {
+export function SidebarItem({ label, icon, active, muted, onClick, onContextMenu, indent = 0, extra, extraAlwaysVisible = false, extraWidth, title }: {
   label: string
   icon?: React.ReactNode
   active?: boolean
@@ -113,12 +113,15 @@ export function SidebarItem({ label, icon, active, muted, onClick, onContextMenu
   extra?: React.ReactNode
   extraAlwaysVisible?: boolean
   extraWidth?: number
+  /** Native tooltip (shown after OS delay) — useful for truncated labels / metadata. */
+  title?: string
 }): React.JSX.Element {
   const theme = useTheme()
   const fonts = useAppFonts()
   const [hovered, setHovered] = useState(false)
   return (
     <div
+      title={title}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onMouseEnter={() => setHovered(true)}

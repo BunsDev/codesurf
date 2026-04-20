@@ -4058,6 +4058,10 @@ function App(): JSX.Element {
                       justifyContent: 'center',
                       width: 18,
                       height: 18,
+                      // Nudged 2px down so the × optically aligns with the
+                      // centre of the workspace-tab label (the 600-weight
+                      // title pushes the glyph above centre otherwise).
+                      marginTop: 2,
                       marginBottom: 1,
                       border: 'none',
                       borderRadius: 4,
@@ -4186,6 +4190,10 @@ function App(): JSX.Element {
                       justifyContent: 'center',
                       width: 18,
                       height: 18,
+                      // Nudged 2px down so the × optically aligns with the
+                      // centre of the workspace-tab label (the 600-weight
+                      // title pushes the glyph above centre otherwise).
+                      marginTop: 2,
                       marginBottom: 1,
                       border: 'none',
                       borderRadius: 4,

@@ -20,6 +20,11 @@ import { getAgentPath, getShellEnvPath } from '../agent-paths'
 import { updateLinks } from '../peer-state'
 import { parseClaudeStream } from '../agent-stream'
 import { ensureLocalProxyRunning } from './localProxy'
+import {
+  applyProjectContextPolicy,
+  buildProviderContextPolicy,
+  describeProjectContextEnvelope,
+} from '../privacy/provider-context-policy'
 import type { ExecutionHostRecord, ExecutionPreference, ExtensionChatTransportConfig } from '../../shared/types'
 import { daemonClient } from '../daemon/client'
 import { ensureDaemonRunning } from '../daemon/manager'
@@ -601,7 +606,21 @@ async function attachDaemonJobStream(cardId: string, host: ExecutionHostRecord, 
 }
 
 async function sendChatToDaemon(req: ChatRequest, host: ExecutionHostRecord): Promise<{ ok: boolean; jobId: string; detached?: boolean }> {
-  const projectContext = await buildProjectContext(req.workspaceDir)
+  const rawProjectContext = await buildProjectContext(req.workspaceDir)
+  const contextPolicy = buildProviderContextPolicy({
+    executionTarget: req.executionTarget,
+    hostType: host.type,
+  })
+  const projectContext = applyProjectContextPolicy(rawProjectContext, contextPolicy)
+
+  log('daemon projectContext policy', {
+    hostType: host.type,
+    executionTarget: req.executionTarget ?? 'local',
+    reason: contextPolicy.reason,
+    raw: describeProjectContextEnvelope(rawProjectContext),
+    effective: describeProjectContextEnvelope(projectContext),
+  })
+
   const job = await hostRequest<{
     id: string
     status: string

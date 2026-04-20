@@ -7147,6 +7147,16 @@ function ToolbarPill({ prefix, label, color, active, onClick, disabled, title }:
   )
 }
 
+// Mode-pill accent colours are tuned for dark backgrounds. On light surfaces
+// the bright tokens (especially green) wash out and read as pastel — map them
+// to denser, WCAG-friendly variants when the theme is in light mode.
+const FOOTER_PILL_LIGHT_COLOR: Record<string, string> = {
+  '#3fb950': '#1f883d', // green  → deeper moss
+  '#58a6ff': '#1f6feb', // blue   → deeper cobalt
+  '#ffb432': '#a66300', // amber  → darker ochre
+  '#e54d2e': '#c3361c', // red    → darker crimson
+}
+
 function FooterPill({ prefix, label, color, active, onClick }: {
   prefix?: React.ReactNode
   label: string
@@ -7157,6 +7167,10 @@ function FooterPill({ prefix, label, color, active, onClick }: {
   const fonts = useFonts()
   const theme = useTheme()
   const [h, setH] = useState(false)
+  const isLight = theme.mode === 'light'
+  const resolvedColor = color
+    ? (isLight ? (FOOTER_PILL_LIGHT_COLOR[color.toLowerCase()] ?? color) : color)
+    : undefined
 
   return (
     <button
@@ -7172,7 +7186,7 @@ function FooterPill({ prefix, label, color, active, onClick }: {
         cursor: 'pointer',
         fontSize: CHAT_FOOTER_TEXT_SIZE,
         fontFamily: fonts.sans,
-        color: color ?? (active || h ? theme.chat.text : theme.chat.textSecondary),
+        color: resolvedColor ?? (active || h ? theme.chat.text : theme.chat.textSecondary),
         transition: 'color 0.1s',
         whiteSpace: 'nowrap',
         minHeight: 24,

@@ -57,7 +57,7 @@ export function ensureShimmerStyles(): void {
 // Bump this version suffix whenever the injected CSS below changes so that
 // Vite HMR re-injects a fresh <style> tag instead of short-circuiting on the
 // stale one left behind from a previous build.
-const CODE_LAYOUT_STYLE_VERSION = 'v7'
+const CODE_LAYOUT_STYLE_VERSION = 'v8'
 const CODE_LAYOUT_STYLE_ID = `shared-streamdown-code-layout-${CODE_LAYOUT_STYLE_VERSION}`
 
 export function ensureCodeBlockLayoutStyles(): void {
@@ -86,6 +86,10 @@ export function ensureCodeBlockLayoutStyles(): void {
       height: auto !important;
       margin: 6px 0 !important;
       border-radius: 6px !important;
+      /* CSS-var backed backgrounds so theme tokens win even after Shiki's
+         async DOM replacement inlines its own (dark) bg. ChatMarkdown root
+         sets --chat-code-{shell,body,header}-bg on the container. */
+      background: var(--chat-code-shell-bg, transparent) !important;
     }
     /* Inner body: flatten streamdown's default rounded border, tighten padding,
        and force a small monospace font so we don't get huge Shiki defaults. */
@@ -100,6 +104,8 @@ export function ensureCodeBlockLayoutStyles(): void {
       padding: 6px 10px !important;
       font-size: 11px !important;
       line-height: 1.45 !important;
+      background: var(--chat-code-body-bg, transparent) !important;
+      color: var(--chat-code-fg, inherit) !important;
     }
     [data-streamdown="code-block-body"] pre {
       white-space: pre !important;
@@ -109,12 +115,16 @@ export function ensureCodeBlockLayoutStyles(): void {
       padding: 0 !important;
       font-size: inherit !important;
       line-height: inherit !important;
+      /* Shiki inlines its own background on <pre> — force-transparent so the
+         body-level var wins and we don't get a dark shiki bg in light mode. */
+      background: transparent !important;
     }
     [data-streamdown="code-block-body"] pre > code {
       display: block;
       white-space: pre !important;
       font-size: inherit !important;
       line-height: inherit !important;
+      background: transparent !important;
     }
     /* Force each line-span onto its own row. Streamdown only adds a block
        className when lineNumbers is enabled; without that, bare spans render
@@ -135,6 +145,8 @@ export function ensureCodeBlockLayoutStyles(): void {
       display: flex !important;
       align-items: center !important;
       box-sizing: border-box !important;
+      background: var(--chat-code-header-bg, transparent) !important;
+      color: var(--chat-code-header-color, inherit) !important;
     }
     /* Pin the copy/actions cluster to the top-right corner of the block so
        it shares the header row regardless of where streamdown places it in
@@ -437,6 +449,7 @@ export const ChatMarkdown = React.memo(({ text, isStreaming, className }: {
   const ref = useRef<HTMLDivElement>(null)
   const theme = useTheme()
   const fonts = useAppFonts()
+  const tokens = useThemeTokens()
   useEffect(() => {
     ensureShimmerStyles()
     ensureCodeBlockLayoutStyles()
@@ -455,6 +468,14 @@ export const ChatMarkdown = React.memo(({ text, isStreaming, className }: {
         ['--chat-link-color' as string]: theme.accent.base,
         ['--chat-link-hover-color' as string]: theme.accent.hover,
         ['--chat-table-border' as string]: theme.border.subtle,
+        // Expose code-block tokens as CSS vars so the static stylesheet can
+        // enforce backgrounds with !important — this beats Shiki's async
+        // inline bg that was making commands render dark in light mode.
+        ['--chat-code-shell-bg' as string]: tokens.code.shellBackground,
+        ['--chat-code-body-bg' as string]: tokens.code.bodyBackground,
+        ['--chat-code-header-bg' as string]: tokens.code.headerBackground,
+        ['--chat-code-header-color' as string]: tokens.code.headerColor,
+        ['--chat-code-fg' as string]: theme.text.primary,
       }}
     >
       <ChatStreamdown text={text} isStreaming={isStreaming} className={className} />

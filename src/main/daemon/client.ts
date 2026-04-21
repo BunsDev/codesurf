@@ -173,6 +173,21 @@ export const daemonClient = {
       body: { workspaceId, checkpointId, sessionEntryId: sessionEntryId ?? null },
     })
   },
+  loadMemoryContext(workspaceId: string, executionTarget: 'local' | 'cloud' = 'local'): Promise<{
+    executionTarget: 'local' | 'cloud'
+    includedBuckets: string[]
+    sections: Array<{
+      scope: string
+      bucket: string
+      displayPath: string
+      path: string
+      importedFrom?: string | null
+      content: string
+    }>
+    prompt?: string
+  }> {
+    return daemonRequest(`/memory/load?workspaceId=${encodeURIComponent(workspaceId)}&executionTarget=${encodeURIComponent(executionTarget)}`)
+  },
   listExternalSessions(workspacePath: string | null, force = false): Promise<AggregatedSessionEntry[]> {
     const normalizedPath = String(workspacePath ?? '').trim()
     const query = new URLSearchParams()

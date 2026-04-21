@@ -103,6 +103,7 @@ interface ChatRequest {
     detachedDaemonAvailable: boolean
     detachedDaemonPreferred: boolean
   }
+  memoryPrompt?: string
 }
 
 function log(...args: unknown[]): void {
@@ -544,6 +545,13 @@ function buildAsyncExecutionContext(params: {
   }
 }
 
+function joinPromptSections(...sections: Array<string | undefined | null>): string | undefined {
+  const normalized = sections
+    .map(section => String(section ?? '').trim())
+    .filter(Boolean)
+  return normalized.length > 0 ? normalized.join('\n\n') : undefined
+}
+
 function buildAsyncExecutionPrompt(asyncExecution: ChatRequest['asyncExecution']): string | undefined {
   if (!asyncExecution) return undefined
 
@@ -569,15 +577,33 @@ function buildAsyncExecutionPrompt(asyncExecution: ChatRequest['asyncExecution']
   return lines.join('\n')
 }
 
-function buildClaudeAgentPrompt(basePrompt: string | undefined, asyncExecution: ChatRequest['asyncExecution']): string | undefined {
+function buildClaudeAgentPrompt(
+  basePrompt: string | undefined,
+  memoryPrompt: string | undefined,
+  asyncExecution: ChatRequest['asyncExecution'],
+): string | undefined {
   const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
-  if (basePrompt && asyncPrompt) return `${basePrompt}\n\n${asyncPrompt}`
-  return basePrompt ?? asyncPrompt
+  return joinPromptSections(basePrompt, memoryPrompt, asyncPrompt)
 }
 
-function buildCodexPrompt(userText: string, asyncExecution: ChatRequest['asyncExecution']): string {
+function buildCodexPrompt(
+  userText: string,
+  asyncExecution: ChatRequest['asyncExecution'],
+  memoryPrompt?: string,
+): string {
   const asyncPrompt = buildAsyncExecutionPrompt(asyncExecution)
-  return asyncPrompt ? `${asyncPrompt}\n\n## User Request\n${userText}` : userText
+  const preamble = joinPromptSections(memoryPrompt, asyncPrompt)
+  return preamble ? `${preamble}\n\n## User Request\n${userText}` : userText
+}
+
+async function loadRuntimeMemoryPrompt(req: ChatRequest): Promise<string | undefined> {
+  if (!req.workspaceId) return undefined
+  const context = await daemonClient.loadMemoryContext(
+    req.workspaceId,
+    req.executionTarget === 'cloud' ? 'cloud' : 'local',
+  )
+  const prompt = String(context?.prompt ?? '').trim()
+  return prompt || undefined
 }
 
 async function selectChatExecutionHost(req: ChatRequest): Promise<ExecutionHostRecord | null> {
@@ -1277,7 +1303,7 @@ function chatClaude(req: ChatRequest): void {
     ].join('\n')
     log('systemPrompt built for', req.peers.length, 'peers, contex tools:', contexToolNames.length)
   }
-  systemPrompt = buildClaudeAgentPrompt(systemPrompt, req.asyncExecution)
+  systemPrompt = buildClaudeAgentPrompt(systemPrompt, req.memoryPrompt, req.asyncExecution)
 
   // Resolve claude binary from startup detection
   const claudePath = getAgentPath('claude')
@@ -1957,7 +1983,7 @@ function chatCodex(req: ChatRequest): void {
   } else {
     args.push('--skip-git-repo-check')
   }
-  args.push(buildCodexPrompt(lastUserMsg.content, req.asyncExecution))
+  args.push(buildCodexPrompt(lastUserMsg.content, req.asyncExecution, req.memoryPrompt))
 
   const proc = spawn(codexBin, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -2868,6 +2894,21 @@ export function registerChatIPC(): void {
       }),
     }
 
+    let memoryPrompt: string | undefined
+    try {
+      memoryPrompt = await loadRuntimeMemoryPrompt(effectiveRequest)
+    } catch (error) {
+      sendStream(req.cardId, {
+        type: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      })
+      sendStream(req.cardId, { type: 'done' })
+      return { ok: false }
+    }
+    const requestWithMemory: ChatRequest = memoryPrompt
+      ? { ...effectiveRequest, memoryPrompt }
+      : effectiveRequest
+
     if (daemonHost) {
       log('chat execution route', {
         cardId: req.cardId,
@@ -2880,7 +2921,7 @@ export function registerChatIPC(): void {
         hostId: daemonHost.id,
         hostType: daemonHost.type,
       })
-      return await sendChatToDaemon(effectiveRequest, daemonHost)
+      return await sendChatToDaemon(requestWithMemory, daemonHost)
     }
 
     if (requestedRunMode === 'background') {
@@ -2902,18 +2943,18 @@ export function registerChatIPC(): void {
       backend: 'runtime',
     })
 
-    switch (effectiveRequest.provider) {
-      case 'claude': chatClaude(effectiveRequest); break
-      case 'codex': chatCodex(effectiveRequest); break
-      case 'opencode': chatOpencode(effectiveRequest); break
-      case 'openclaw': chatOpenclaw(effectiveRequest); break
-      case 'hermes': chatHermes(effectiveRequest); break
+    switch (requestWithMemory.provider) {
+      case 'claude': chatClaude(requestWithMemory); break
+      case 'codex': chatCodex(requestWithMemory); break
+      case 'opencode': chatOpencode(requestWithMemory); break
+      case 'openclaw': chatOpenclaw(requestWithMemory); break
+      case 'hermes': chatHermes(requestWithMemory); break
       default:
-        if (effectiveRequest.providerTransport?.type === 'local-proxy') {
-          chatLocalProxy(effectiveRequest)
+        if (requestWithMemory.providerTransport?.type === 'local-proxy') {
+          chatLocalProxy(requestWithMemory)
         } else {
-          sendStream(effectiveRequest.cardId, { type: 'error', error: `Unsupported provider: ${effectiveRequest.provider}` })
-          sendStream(effectiveRequest.cardId, { type: 'done' })
+          sendStream(requestWithMemory.cardId, { type: 'error', error: `Unsupported provider: ${requestWithMemory.provider}` })
+          sendStream(requestWithMemory.cardId, { type: 'done' })
         }
     }
 

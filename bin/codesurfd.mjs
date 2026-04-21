@@ -8,6 +8,7 @@ import { homedir } from 'node:os'
 import { findSessionEntryById, getExternalSessionChatState, invalidateExternalSessionCache, listExternalSessionEntries } from './session-index.mjs'
 import { createChatJobManager } from './chat-jobs.mjs'
 import { createCheckpointStore } from './checkpoints.mjs'
+import { loadMemoryContext } from './memory-loader.mjs'
 
 const HOME = process.env.CODESURF_HOME || join(homedir(), '.codesurf')
 const PID_PATH = process.env.CODESURF_DAEMON_PID_PATH || join(HOME, 'daemon', 'pid.json')
@@ -1797,6 +1798,21 @@ function resolveWorkspaceProjectPath(workspaceId, fallbackPath = null) {
   return projectPaths[0] ?? normalizePath(fallbackPath)
 }
 
+async function loadWorkspaceMemoryContext(workspaceId, executionTarget = 'local') {
+  const state = readWorkspaceState()
+  const workspace = state.workspaces.find(entry => entry.id === workspaceId)
+  if (!workspace) {
+    throw new Error(`Workspace not found: ${workspaceId}`)
+  }
+  const materialized = materializeWorkspace(workspace, state.projects)
+  return await loadMemoryContext({
+    homeDir: HOME,
+    workspaceDir: materialized.path,
+    projectPaths: materialized.projectPaths,
+    executionTarget,
+  })
+}
+
 function listDaemonWorkspaceSessions(workspaceId, existingEntries) {
   const state = readWorkspaceState()
   const workspace = state.workspaces.find(entry => entry.id === workspaceId)
@@ -2313,13 +2329,44 @@ const server = createServer(async (req, res) => {
       return
     }
 
+    if (method === 'GET' && url.pathname === '/memory/load') {
+      const workspaceId = String(url.searchParams.get('workspaceId') ?? '').trim()
+      const executionTarget = url.searchParams.get('executionTarget') === 'cloud' ? 'cloud' : 'local'
+      if (!workspaceId) {
+        sendJson(res, 400, { error: 'workspaceId is required' })
+        return
+      }
+      sendJson(res, 200, await loadWorkspaceMemoryContext(workspaceId, executionTarget))
+      return
+    }
+
     if (method === 'POST' && url.pathname === '/chat/job/start') {
       const body = await parseRequestBody(req)
       if (!body?.request || typeof body.request !== 'object') {
         sendJson(res, 400, { error: 'request is required' })
         return
       }
-      const job = await chatJobs.startJob(body.request)
+      let request = body.request
+      if (!String(request?.memoryPrompt ?? '').trim() && typeof request?.workspaceId === 'string' && request.workspaceId.trim()) {
+        try {
+          const memoryContext = await loadWorkspaceMemoryContext(
+            request.workspaceId.trim(),
+            request.executionTarget === 'cloud' ? 'cloud' : 'local',
+          )
+          const prompt = String(memoryContext?.prompt ?? '').trim()
+          if (prompt) {
+            request = {
+              ...request,
+              memoryPrompt: prompt,
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof Error && /Workspace not found:/i.test(error.message))) {
+            throw error
+          }
+        }
+      }
+      const job = await chatJobs.startJob(request)
       sendJson(res, 200, job)
       return
     }

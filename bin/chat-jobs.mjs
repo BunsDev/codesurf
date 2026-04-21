@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
-import { buildInstructionPrompt, loadInstructionContext } from './instruction-context.mjs'
+import { buildMemoryPrompt, loadMemoryContext } from './memory-loader.mjs'
 import { applyProjectContextPolicy } from './project-context.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -809,12 +809,13 @@ export function createChatJobManager({ homeDir }) {
 
   async function runJob(job, request, workspaceDir) {
     try {
-      const instructionContext = await loadInstructionContext({
+      const memoryContext = await loadMemoryContext({
         homeDir,
         workspaceDir,
+        projectPaths: [workspaceDir],
         executionTarget: request.executionTarget ?? 'local',
       })
-      const instructionPrompt = buildInstructionPrompt(instructionContext)
+      const instructionPrompt = String(request.memoryPrompt ?? '').trim() || buildMemoryPrompt(memoryContext)
 
       if (request.provider === 'claude') {
         await runClaudeJob(job, request, workspaceDir, instructionPrompt)
